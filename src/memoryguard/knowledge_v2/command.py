@@ -504,12 +504,13 @@ class KnowledgeV2CommandService:
         source = _safe_source(payload.get("path"))
         title = str(payload.get("title") or "").strip()
         task_scope = self._runtime_scope(scope, context)
-        key = f"knowledge-add:{_scope_digest(scope)}:{source}:{title}"
-        result = self.tasks.start(
+        key = str(payload.get("idempotency_key") or f"knowledge-add:{_scope_digest(scope)}:{source}:{title}").strip()
+        result = self.tasks.start_scope_exclusive(
             operation="knowledge_source_add",
-            idempotency_key=key,
+            key=key,
             scope=task_scope,
             worker=lambda execution: self._ingest(source, title=title, scope=scope, execution=execution),
+            request={"path": source, "title": title},
         )
         result["operation"] = "knowledge_source_add"
         return result
@@ -521,12 +522,13 @@ class KnowledgeV2CommandService:
             raise KnowledgeV2CommandError("knowledge_book_not_found")
         source = _safe_source(asset.source_ref)
         task_scope = self._runtime_scope(scope, context)
-        key = f"knowledge-reingest:{book_id}:{asset.updated_at}"
-        result = self.tasks.start(
+        key = str(payload.get("idempotency_key") or f"knowledge-reingest:{book_id}:{asset.updated_at}").strip()
+        result = self.tasks.start_scope_exclusive(
             operation="knowledge_reingest",
-            idempotency_key=key,
+            key=key,
             scope=task_scope,
             worker=lambda execution: self._ingest(source, title=asset.title, scope=scope, execution=execution, asset_id=book_id),
+            request={"book_id": book_id, "source": source, "asset_updated_at": asset.updated_at},
         )
         result["operation"] = "knowledge_reingest"
         return result
@@ -537,7 +539,7 @@ class KnowledgeV2CommandService:
         if asset is None:
             raise KnowledgeV2CommandError("knowledge_book_not_found")
         task_scope = self._runtime_scope(scope, context)
-        key = f"knowledge-rebuild:{book_id}:{asset.updated_at}"
+        key = str(payload.get("idempotency_key") or f"knowledge-rebuild:{book_id}:{asset.updated_at}").strip()
 
         def worker(execution: TaskExecution) -> Mapping[str, Any]:
             execution.progress(20, "reading_references")
@@ -556,11 +558,12 @@ class KnowledgeV2CommandService:
             )
             return result
 
-        result = self.tasks.start(
+        result = self.tasks.start_scope_exclusive(
             operation="knowledge_rebuild_smart",
-            idempotency_key=key,
+            key=key,
             scope=task_scope,
             worker=worker,
+            request={"book_id": book_id, "asset_updated_at": asset.updated_at},
         )
         result["operation"] = "knowledge_rebuild_smart"
         return result

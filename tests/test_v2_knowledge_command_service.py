@@ -5,8 +5,11 @@ from pathlib import Path
 import sqlite3
 import time
 
+import pytest
+
 from memoryguard.content import ContentReadScope, ContentStore
 from memoryguard.knowledge_v2.command import KnowledgeV2CommandService
+from memoryguard.runtime_v2.task_coordinator import TaskCoordinatorError
 from memoryguard.runtime_v2.working_memory import RuntimeScope, RuntimeStore
 
 
@@ -89,6 +92,33 @@ def test_knowledge_add_uses_content_plane_and_runtime_task(tmp_path: Path) -> No
         texts = [str(row[0]) for row in conn.execute("SELECT text FROM content_blobs")]
     assert any("This exact body belongs only in content.db." in text for text in texts)
 
+    service.close()
+
+
+def test_knowledge_add_reuses_matching_request_and_rejects_reused_key(tmp_path: Path) -> None:
+    first_source = tmp_path / "first"
+    first_source.mkdir()
+    (first_source / "a.md").write_text("# First\n\nbody", encoding="utf-8")
+    other_source = tmp_path / "other"
+    other_source.mkdir()
+    (other_source / "b.md").write_text("# Other\n\nbody", encoding="utf-8")
+    service = KnowledgeV2CommandService(tmp_path)
+    scope = _scope(tmp_path)
+    request = {"path": str(first_source), "title": "First", "idempotency_key": "knowledge-request"}
+
+    accepted = service.add(request, scope=scope, context=_context())
+    assert _wait(service, tmp_path, accepted["task"]["run_id"])["status"] == "succeeded"
+    replay = service.add(request, scope=scope, context=_context())
+    assert replay["reused"] is True
+    assert replay["code"] == "idempotent_replay"
+    assert replay["task"]["run_id"] == accepted["task"]["run_id"]
+
+    with pytest.raises(TaskCoordinatorError, match="idempotency_key_reused"):
+        service.add(
+            {"path": str(other_source), "title": "Other", "idempotency_key": "knowledge-request"},
+            scope=scope,
+            context=_context(),
+        )
     service.close()
 
 

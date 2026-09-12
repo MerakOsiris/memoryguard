@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sqlite3
+import time
 
 import pytest
 
@@ -10,6 +11,7 @@ from memoryguard.codegraph_v2 import CodeGraphScope, CodeGraphStore
 from memoryguard.codegraph_v2.graphify_adapter import EXPORT_FORMAT, GraphifyExportAdapter
 from memoryguard.runtime_v2.group_native import GroupControlService
 from memoryguard.runtime_v2.native_ports import NativeContextError, NativeV2RuntimePort, bind_native_transport_context
+from memoryguard.runtime_v2.source_control import SourceControlService
 from memoryguard.rule_scope import canonical_project_ref
 
 
@@ -31,6 +33,24 @@ def _context(root: Path):
         ),
         workspace_id=str(root),
         share_group_id="group-bound",
+    )
+
+
+def _projectless_context(root: Path):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-bound",
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="projectless-source-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(root),
+        share_group_id="group-bound",
+        provider="codex",
+        runtime_role="root",
     )
 
 
@@ -170,6 +190,78 @@ def test_native_codegraph_canonical_operations_and_production_filter(tmp_path: P
     assert incremental["queue_depth"] == 0
     if status["data"]["update_ready"] is False:
         assert status["data"]["capability_error"]
+
+
+def test_projectless_source_selector_closes_build_query_status_update_graph_loop(tmp_path: Path) -> None:
+    source_root = tmp_path / "outside-project"
+    source_root.mkdir()
+    (source_root / "entry.py").write_text(
+        "def built_from_source():\n    return 1\n",
+        encoding="utf-8",
+    )
+    CodeGraphStore(tmp_path)
+    GroupControlService(tmp_path, write=True).bind_agent(
+        "agent-bound", "group-bound", idempotency_key="projectless-binding",
+    )
+    source = SourceControlService(tmp_path).add(
+        str(source_root),
+        "selected_directory",
+        {"admin": True, "agent_instance_id": "agent-bound"},
+    )
+    context = _projectless_context(tmp_path)
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+
+    built = port.dispatch_mcp(
+        "memoryguard_codegraph_build_bound",
+        {"source_id": source["source_id"], "confirmed": True, "idempotency_key": "projectless-build"},
+        context=context,
+        generation=1,
+    )
+    assert built["ok"] is True, built
+    build_data = built.get("data", built)
+    job_id = build_data["job_id"]
+    task_scope = port._gui_task_scope(context)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        task = port._task_service().status(job_id, task_scope)
+        if task["status"] in {"succeeded", "failed", "cancelled"}:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("projectless CodeGraph build did not finish")
+    assert task["status"] == "succeeded", task
+
+    selected = {"codegraph_source_id": source["source_id"]}
+    queried = port.dispatch_mcp(
+        "memoryguard_codegraph_query",
+        {**selected, "query": "built_from_source", "provenance": "production"},
+        context=context,
+        generation=1,
+    )
+    assert queried["ok"] is True, queried
+    assert [item["name"] for item in queried["data"]["symbols"]] == ["built_from_source"]
+    status = port.dispatch_mcp(
+        "memoryguard_codegraph_status", selected, context=context, generation=1,
+    )
+    assert status["ok"] is True, status
+    assert status["data"]["counts"]["source_files"] == 1
+
+    updated = port.dispatch_mcp(
+        "memoryguard_codegraph_update",
+        {**selected, "confirmed": True, "export": _export(), "full_snapshot": True},
+        context=context,
+        generation=1,
+    )
+    assert updated["ok"] is True, updated
+    assert updated["data"]["scope_digest"] == queried["data"]["scope_digest"]
+    graph = port.dispatch_mcp(
+        "memoryguard_codegraph_graph",
+        {**selected, "provenance": "production", "limit": 100},
+        context=context,
+        generation=1,
+    )
+    assert graph["ok"] is True, graph
+    assert any(node.get("label") == "addBook" for node in graph["data"]["nodes"])
 
 
 def test_native_codegraph_status_keeps_incremental_pending_without_graph_or_binding(tmp_path: Path) -> None:

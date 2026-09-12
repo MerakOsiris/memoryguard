@@ -27,9 +27,17 @@ from typing import Any, Mapping
 
 from . import __version__ as PACKAGE_VERSION
 from .cutover_v2.surfaces import (
+    GUI_OPERATION_SPECS,
+    GUI_MUTATION_NAMES,
+    MCP_BROKER_GUI_ADMIN_NAMES,
+    MCP_BROKER_GUI_EXCLUDED,
+    MCP_BROKER_GUI_HOST_BOUND_NAMES,
+    MCP_BROKER_GUI_METHOD_NAMES,
     MCP_DEFAULT_PUBLIC_TOOL_NAMES,
+    MCP_GUI_BRIDGE_OPERATIONS,
     MCP_MUTATION_NAMES,
     MCP_TOOL_NAMES,
+    resolve_mcp_broker_invocation,
 )
 from .runtime_v2.public_safety import (
     safe_error_code,
@@ -110,1223 +118,17 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memoryguard"
 SERVER_VERSION = PACKAGE_VERSION
 
-_FULL_TOOLS = [
-    {
-        "name": "memoryguard_audit",
-        "description": (
-            "Use when checking local V2 reference integrity before repair or release. "
-            "Do not use to read a memory record, modify data, or assess general Agent quality."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-        },
-    },
-    {
-        "name": "memoryguard_explain",
-        "description": (
-            "Use when a memoryguard_audit finding_id needs its evidence, impact, and suggested repair. "
-            "Do not use for generic memory lookup or to apply a repair."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "finding_id": {"type": "string", "description": "finding id from audit"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-            "required": ["finding_id"],
-        },
-    },
-    {
-        "name": "memoryguard_list_sources",
-        "description": "List authorized sources (project directory, selected folders, Obsidian vaults). Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-        },
-    },
-    {
-        "name": "memoryguard_scan_summary",
-        "description": "Run a read-only scan and return snapshot + coverage ledger. Proves scan completeness (unaccounted_count must be 0).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-        },
-    },
-    {
-        "name": "memoryguard_neuron_graph",
-        "description": "Read the scoped neuron graph projection (read-only). Requires explicit agent_instance_id or share_group_id. Returns {empty: true, reason: 'not_built'|'missing_governance_scope'|...}.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "mode": {"type": "string", "description": "native | reconstructed (default: reconstructed)"},
-                "agent_instance_id": {"type": "string", "description": "single-agent governance scope"},
-                "share_group_id": {"type": "string", "description": "MCP shared-memory scope (mutually exclusive with agent)"},
-            },
-        },
-    },
-    {
-        "name": "memoryguard_codegraph_graph",
-        "description": (
-            "Read one bounded scoped CodeGraph overview: symbol metadata, "
-            "edges, and source-file references. Source bodies are never returned."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "codegraph_project_ref": {"type": "string", "description": "trusted CodeGraph project selector"},
-                "codegraph_source_id": {"type": "string", "description": "trusted CodeGraph source selector"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "maximum graph nodes (default 100)"},
-                "provenance": {"type": "string", "enum": ["production", "test", "fixture", "generated", "vendor", "unknown"], "description": "optional source provenance filter"},
-            },
-        },
-    },
-    {
-        "name": "memoryguard_codegraph_query",
-        "description": "Query scoped CodeGraph symbol metadata. Source bodies are never returned.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string"},
-                "query": {"type": "string"},
-                "provenance": {"type": "string", "enum": ["production", "test", "fixture", "generated", "vendor", "unknown"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "memoryguard_codegraph_path",
-        "description": "Find one bounded directed path between two scoped CodeGraph symbols.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string"},
-                "start_id": {"type": "string"},
-                "end_id": {"type": "string"},
-                "max_depth": {"type": "integer", "minimum": 1, "maximum": 32},
-                "relation": {"type": "string"},
-                "provenance": {"type": "string", "enum": ["production", "test", "fixture", "generated", "vendor", "unknown"]},
-            },
-            "required": ["start_id", "end_id"],
-        },
-    },
-    {
-        "name": "memoryguard_codegraph_explain",
-        "description": "Explain one scoped CodeGraph symbol with metadata-only source map and bounded edges.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string"},
-                "symbol_id": {"type": "string"},
-                "provenance": {"type": "string", "enum": ["production", "test", "fixture", "generated", "vendor", "unknown"]},
-                "edge_limit": {"type": "integer", "minimum": 1, "maximum": 200},
-            },
-            "required": ["symbol_id"],
-        },
-    },
-    {
-        "name": "memoryguard_codegraph_affected",
-        "description": "Return bounded reverse-impact metadata for one scoped CodeGraph symbol.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string"},
-                "start_id": {"type": "string"},
-                "depth": {"type": "integer", "minimum": 0, "maximum": 32},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
-                "relation": {"type": "string"},
-                "provenance": {"type": "string", "enum": ["production", "test", "fixture", "generated", "vendor", "unknown"]},
-            },
-            "required": ["start_id"],
-        },
-    },
-    {
-        "name": "memoryguard_codegraph_update",
-        "description": "Project a trusted MemoryGuard Graphify Core metadata export into scoped CodeGraph storage. Source bodies are rejected.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string"},
-                "export": {"type": "object"},
-                "full_snapshot": {"type": "boolean"},
-                "confirmed": {"type": "boolean"},
-            },
-            "required": ["export", "confirmed"],
-        },
-    },
-    {
-        "name": "memoryguard_codegraph_status",
-        "description": "Report scoped CodeGraph counts and Graphify metadata-export capability without claiming production readiness.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"workspace": {"type": "string"}},
-        },
-    },
-    {
-        "name": "memoryguard_import_preview",
-        "description": "Preview an offline import bundle (ChatGPT/Claude/Gemini/Generic). Read-only detection + inventory.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "bundle path (file or dir)"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-            "required": ["path"],
-        },
-    },
-    # --- v3.2 memory backend tools ---
-    {
-        "name": "memoryguard_memory_read",
-        "description": (
-            "Use when an exact memory_id is already known and its governed record is needed. "
-            "Do not use for discovery; use memoryguard_memory_search instead."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "memory_id": {"type": "string", "description": "memory record ID"},
-                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
-            },
-            "required": ["memory_id"],
-        },
-    },
-    {
-        "name": "memoryguard_memory_search",
-        "description": (
-            "Use when finding governed memories by text and lifecycle status. "
-            "Do not use when an exact memory_id is known; use memoryguard_memory_read instead."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "search query"},
-                "status": {"type": "string", "enum": ["active", "low_confidence", "shadowed", "conflicted", "quarantined", "deleted"], "description": "lifecycle status filter; defaults to active"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "maximum results to return (default: 5 for conversation recall)"},
-                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
-            },
-        },
-    },
-    {
-        "name": "memoryguard_memory_write",
-        "description": (
-            "Use when user explicitly asks to retain a durable fact, preference, project decision, or procedure. "
-            "Do not use for raw transcripts or temporary task notes. Writes locally and may organize duplicates or conflicts."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "body": {"type": "string", "description": "memory content"},
-                "kind": {"type": "string", "enum": ["preference", "fact", "project", "procedure", "episode", "correction"], "description": "optional kind override; omit for native classification"},
-                "injection_policy": {"type": "string", "enum": ["relevant", "always"], "default": "relevant", "description": "relevant participates in task recall; always is a mandatory rule"},
-                "priority": {"type": "integer", "minimum": -100, "maximum": 100, "default": 0, "description": "stable ordering within the mandatory rule package"},
-                "audience": {"type": "array", "description": "mandatory-rule assignments; omitted always defaults to the trusted current agent", "items": {"type": "object"}},
-                "write_policy": {"type": "string", "description": "optional write policy; propose_only creates a low_confidence candidate, while omission uses automatic organization"},
-                "metadata": {"type": "object", "description": "optional metadata from agent"},
-                "idempotency_key": {"type": "string", "description": "optional retry key bound to content, metadata, kind and policy"},
-                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
-            },
-            "required": ["body"],
-        },
-    },
-    {
-        "name": "memoryguard_memory_update",
-        "description": (
-            "Use when owner must correct body, kind, recall policy, or priority of one known memory. "
-            "Do not use to create a record, change lifecycle status, or modify another owner's memory."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "memory_id": {"type": "string", "description": "memory record ID"},
-                "atom_id": {"type": "string", "description": "V2 atom ID; use the source-mapping target when a migrated logical ID is ambiguous"},
-                "body": {"type": "string", "description": "new body"},
-                "kind": {"type": "string", "enum": ["preference", "fact", "project", "procedure", "episode", "correction"], "description": "replacement kind; omit to preserve current kind"},
-                "injection_policy": {"type": "string", "enum": ["relevant", "always"], "description": "new injection policy"},
-                "priority": {"type": "integer", "minimum": -100, "maximum": 100, "description": "new priority"},
-                "audience": {"type": "array", "description": "replace mandatory-rule assignments; only allowed for always records", "items": {"type": "object"}},
-                "idempotency_key": {"type": "string", "description": "optional retry key bound to this target and payload"},
-                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
-            },
-            "required": ["memory_id"],
-        },
-    },
-    {
-        "name": "memoryguard_memory_delete",
-        "description": (
-            "Use when owner must remove one known memory from future recall. "
-            "Do not use for irreversible erasure: this is a local soft-delete recorded as status=deleted."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "memory_id": {"type": "string", "description": "memory record ID"},
-                "idempotency_key": {"type": "string", "description": "required retry key bound to this target; makes repeated deletion safe"},
-                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
-            },
-            "required": ["memory_id", "idempotency_key"],
-        },
-    },
-    {
-        "name": "memoryguard_memory_status",
-        "description": (
-            "Use when checking shared-memory availability, bound scope, total and active records, "
-            "lifecycle and kind counts, and evidence-link count. "
-            "Do not use to search or read individual memory content."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
-            },
-        },
-    },
-    {
-        "name": "memoryguard_memory_merge_safe_preview",
-        "description": (
-            "Read-only preflight for memoryguard_memory_merge_safe. Resolves one "
-            "explicit canonical/duplicate atom pair in the trusted share group, "
-            "returns current atom revisions, policies, priorities, and relation "
-            "safety, and does not write transactions, decisions, undo, or "
-            "idempotency records. There is no force or bypass."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "canonical_memory_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active canonical memory_id in the trusted share group",
-                },
-                "canonical_atom_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active canonical atom_id in the trusted share group",
-                },
-                "duplicate_memory_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active duplicate memory_id in the same share group",
-                },
-                "duplicate_atom_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active duplicate atom_id in the same share group",
-                },
-                "workspace": {"type": "string"},
-            },
-            "required": [],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_memory_merge_safe",
-        "description": (
-            "Admin-only governed supersede of one active same-group duplicate "
-            "memory atom into a stronger canonical atom. Reuses GovernanceV2."
-            "supersede. Requires confirmed=true. There is no force or bypass; "
-            "owner update/delete stay unchanged."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "canonical_memory_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active canonical memory_id in the trusted share group",
-                },
-                "canonical_atom_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active canonical atom_id in the trusted share group",
-                },
-                "duplicate_memory_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active duplicate memory_id in the same share group",
-                },
-                "duplicate_atom_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active duplicate atom_id in the same share group",
-                },
-                "confirmed": {
-                    "type": "boolean",
-                    "description": "must be true; the mutation refuses any other value",
-                },
-                "expected_atom_revisions": {
-                    "type": "object",
-                    "description": "CAS map of involved atom or memory ids to current revisions",
-                },
-                "mutation_receipt": {
-                    "type": "object",
-                    "description": "native mutation receipt for this supersede transaction",
-                    "properties": {
-                        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                        "id": {"type": "string", "minLength": 1, "maxLength": 256},
-                    },
-                },
-                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
-                "workspace": {"type": "string"},
-            },
-            "required": [
-                "confirmed",
-                "expected_atom_revisions",
-                "mutation_receipt",
-                "idempotency_key",
-            ],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_context_bootstrap",
-        "description": (
-            "Use when starting one new task to build bounded mandatory rules and relevant governed memory context. "
-            "Do not use for exact record lookup or repeatedly within same task. Uses trusted binding and may mark one pending local CodeGraph receipt consumed."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "current task or request; required",
-                },
-                "project_hint": {
-                    "type": "string",
-                    "description": "optional project/repository hint used only for relevance",
-                },
-                "max_items": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 20,
-                    "default": 12,
-                    "description": "maximum optional memories to include; mandatory rules use their separate budget",
-                },
-                "max_chars": {
-                    "type": "integer",
-                    "minimum": 256,
-                    "maximum": 12000,
-                    "default": 6000,
-                    "description": "maximum characters for optional recalled content; mandatory rules use their separate budget",
-                },
-                "max_tokens": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 12000,
-                    "description": "optional total-token budget forwarded to the V2 ContextEngine",
-                },
-                "read_path": {
-                    "type": "string",
-                    "enum": ["auto", "rule-intelligence"],
-                    "default": "auto",
-                    "description": "Phase5 canonical read path: auto uses "
-                    "canonical only when the group is canonically ready, "
-                    "otherwise the native compatibility read path; "
-                    "rule-intelligence prefers the rule-intelligence layer, "
-                    "deduplicating merged duplicates only after the "
-                    "active/audience/exclude match",
-                },
-            },
-            "required": ["task"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_feedback",
-        "description": (
-            "Record explicit evidence for a mandatory-rule bootstrap match. "
-            "This closes the loop for follow/violate/not_applicable/corrected decisions. "
-            "One feedback is bound to one receipt_id."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "agent_instance_id": {"type": "string", "description": "trusted identity check"},
-                "receipt_id": {
-                    "type": "string",
-                    "description": "receipt_id returned by memoryguard_context_bootstrap",
-                },
-                "outcome": {
-                    "type": "string",
-                    "enum": [
-                        "followed",
-                        "violated",
-                        "not_applicable",
-                        "corrected",
-                        "exception",
-                        "ignored",
-                    ],
-                    "description": "observed outcome after bootstrap packet is shown",
-                },
-                "actor": {
-                    "type": "string",
-                    "description": (
-                        "deprecated display actor id; source/authority are fixed by MCP "
-                        "transport and never inferred from this value"
-                    ),
-                },
-                "evidence": {
-                    "type": "string",
-                    "description": "optional evidence/notes",
-                },
-                "confidence": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 1,
-                    "description": "confidence score 0-1",
-                },
-                "idempotency_key": {
-                    "type": "string",
-                    "description": "optional retry key bound to content and actor",
-                },
-            },
-            # The caller cannot select the producer.  Older clients may still
-            # send a display actor; when omitted the handler derives one from
-            # the trusted transport identity.
-            "required": ["receipt_id", "outcome"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_create_auto",
-        "description": (
-            "Create one mandatory rule from text. Automatic scope inference is fail-closed: "
-            "only the trusted current agent or that agent plus the trusted project cwd are allowed. "
-            "Broader scope requires explicit manual=true, an explicit scope object, and admin capability."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "minLength": 1, "description": "rule text"},
-                "kind": {"type": "string", "description": "optional preference|fact|project|procedure|episode|correction"},
-                "priority": {"type": "integer", "minimum": -100, "maximum": 100, "default": 0},
-                "scope": {"type": "object", "description": "optional explicit audience assignment; auto mode still rejects broad targets"},
-                "manual": {"type": "boolean", "default": False, "description": "explicit human/admin declaration for broad scope"},
-                "idempotency_key": {"type": "string"},
-                "workspace": {"type": "string", "description": "workspace path (default: configured MemoryGuard workspace)"},
-            },
-            "required": ["text"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_decision_read",
-        "description": "Read one explainable rule lifecycle decision by decision_id. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "decision_id": {"type": "string"},
-                "workspace": {"type": "string"},
-            },
-            "required": ["decision_id"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_undo",
-        "description": "Undo a V2 rule lifecycle mutation (including feedback/evidence compensation) using its persisted pre-rule undo_id. Requires the trusted actor or admin capability.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "undo_id": {"type": "string"},
-                "decision_id": {"type": "string", "description": "optional decision id alias; resolved to its undo_id"},
-                "idempotency_key": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "stable retry key for the compensating V2 mutation",
-                },
-                "workspace": {"type": "string"},
-            },
-            "required": [],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_scope_stats",
-        "description": "Read rule audience statistics and the automatic scope policy. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"workspace": {"type": "string"}},
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_merge_capability_issue",
-        "description": (
-            "Issue one opaque, single-use rule-merge capability for a candidate "
-            "proposal. Requires the trusted admin AccessContext. The raw token "
-            "is returned once to the caller; persistent storage keeps only its hash."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "proposal_id": {"type": "string"},
-                "ttl_seconds": {"type": "number", "exclusiveMinimum": 0, "default": 300},
-                "mutation_receipt": {
-                    "type": "object",
-                    "description": "native mutation receipt; only its bounded receipt id participates in the request proof",
-                    "properties": {
-                        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                        "id": {"type": "string", "minLength": 1, "maxLength": 256},
-                    },
-                },
-                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
-                "recovery_secret": {
-                    "type": "string",
-                    "minLength": 43,
-                    "pattern": "^[A-Za-z0-9_-]+$",
-                    "description": "one-time base64url recovery secret; never persisted or returned by MCP",
-                },
-                "workspace": {"type": "string"},
-            },
-            "required": ["proposal_id", "mutation_receipt", "idempotency_key", "recovery_secret"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_merge_approve",
-        "description": (
-            "Approve one candidate rule-merge proposal with a server-issued "
-            "single-use capability and trusted admin AccessContext."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "proposal_id": {"type": "string"},
-                "capability_token": {"type": "string"},
-                "expected_definition_revisions": {"type": "object"},
-                "mutation_receipt": {
-                    "type": "object",
-                    "description": "native mutation receipt for this approval transaction",
-                    "properties": {
-                        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                        "id": {"type": "string", "minLength": 1, "maxLength": 256},
-                    },
-                },
-                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
-                "workspace": {"type": "string"},
-            },
-            "required": ["proposal_id", "capability_token", "expected_definition_revisions", "mutation_receipt", "idempotency_key"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_merge_acknowledge",
-        "description": (
-            "Acknowledge first-merge risk with a server-issued single-use "
-            "capability and trusted admin AccessContext."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "proposal_id": {"type": "string"},
-                "capability_token": {"type": "string"},
-                "mutation_receipt": {
-                    "type": "object",
-                    "description": "native mutation receipt for this acknowledgement transaction",
-                    "properties": {
-                        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                        "id": {"type": "string", "minLength": 1, "maxLength": 256},
-                    },
-                },
-                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
-                "workspace": {"type": "string"},
-            },
-            "required": ["proposal_id", "capability_token", "mutation_receipt", "idempotency_key"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_merge_cooldown_clear",
-        "description": (
-            "Clear one rule-merge proposal cooldown with a server-issued "
-            "single-use capability and trusted admin AccessContext."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "proposal_id": {"type": "string"},
-                "capability_token": {"type": "string"},
-                "mutation_receipt": {
-                    "type": "object",
-                    "description": "native mutation receipt for this cooldown transaction",
-                    "properties": {
-                        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                        "id": {"type": "string", "minLength": 1, "maxLength": 256},
-                    },
-                },
-                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
-                "workspace": {"type": "string"},
-            },
-            "required": ["proposal_id", "capability_token", "mutation_receipt", "idempotency_key"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_merge_safe_preview",
-        "description": (
-            "Read-only preflight for memoryguard_rule_merge_safe. Resolves the "
-            "requested canonical/duplicate source or definition ids in the "
-            "trusted share group, returns current definition revisions and pair "
-            "safety, and does not write transactions, decisions, undo, "
-            "settlement, or idempotency records. There is no force or bypass; "
-            "composer/pair safety still decides mergeability."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "canonical_source_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active rule_source_links.memory_id in the trusted share group",
-                },
-                "canonical_definition_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active definition id in the trusted share group",
-                },
-                "duplicate_source_ids": {
-                    "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "description": "active duplicate source ids in the same share group",
-                },
-                "duplicate_definition_ids": {
-                    "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "description": "active duplicate definition ids in the same share group",
-                },
-                "workspace": {"type": "string"},
-            },
-            "required": [],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_rule_merge_safe",
-        "description": (
-            "Admin-only source-aware fold of active same-group duplicate rules "
-            "into one canonical definition. Reuses the V2 historical "
-            "reconciliation transaction. Requires confirmed=true. There is no "
-            "force or bypass; composer/pair safety still decides mergeability."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "canonical_source_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active rule_source_links.memory_id in the trusted share group",
-                },
-                "canonical_definition_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "active definition id in the trusted share group",
-                },
-                "duplicate_source_ids": {
-                    "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "description": "active duplicate source ids in the same share group",
-                },
-                "duplicate_definition_ids": {
-                    "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "description": "active duplicate definition ids in the same share group",
-                },
-                "confirmed": {
-                    "type": "boolean",
-                    "description": "must be true; the mutation refuses any other value",
-                },
-                "expected_definition_revisions": {
-                    "type": "object",
-                    "description": "CAS map of involved definition or source ids to current revisions",
-                },
-                "mutation_receipt": {
-                    "type": "object",
-                    "description": "native mutation receipt for this merge transaction",
-                    "properties": {
-                        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                        "id": {"type": "string", "minLength": 1, "maxLength": 256},
-                    },
-                },
-                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
-                "workspace": {"type": "string"},
-            },
-            "required": [
-                "confirmed",
-                "expected_definition_revisions",
-                "mutation_receipt",
-                "idempotency_key",
-            ],
-            "additionalProperties": False,
-        },
-    },
-    # --- v3.2 agent binding tools ---
-    {
-        "name": "memoryguard_binding_create",
-        "description": "Bind an agent instance to a share_group. Creates an AgentBinding record (active). Read-only listing is via binding_list; unbind goes through CLI/GUI.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "agent_instance_id": {"type": "string", "description": "agent instance ID to bind"},
-                "share_group_id": {"type": "string", "description": "share group ID to bind the agent into"},
-                "mcp_server_name": {"type": "string", "description": "MCP server name (default: memoryguard)"},
-                "native_memory_mode": {"type": "string", "description": "native memory mode: observed|redirected|unsupported (default: observed)"},
-                "redirect_paths": {"type": "array", "items": {"type": "string"}, "description": "optional native memory redirect paths"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-            "required": ["agent_instance_id", "share_group_id"],
-        },
-    },
-    {
-        "name": "memoryguard_binding_list",
-        "description": "List existing AgentBinding records. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "include_inactive": {"type": "boolean", "description": "include inactive bindings (default: true)"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-        },
-    },
-    # --- v3.2 external MCP descriptor tools ---
-    {
-        "name": "memoryguard_external_mcp_list",
-        "description": "List imported external MCP server descriptors and their resources. Descriptor-level only (no live MCP client discovery). Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-        },
-    },
-    {
-        "name": "memoryguard_external_mcp_import",
-        "description": "Import a new external MCP descriptor (JSON). Classifies the server (L0-L4), persists it, and returns the detection result. Descriptor-level import only; does not call the live MCP server.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "descriptor_json": {"type": "string", "description": "JSON-encoded MCP descriptor {name|display_name, tools[], resources[], memory_entries[]}"},
-                "server_id": {"type": "string", "description": "server ID (default: derived from descriptor name/display_name)"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-            "required": ["descriptor_json"],
-        },
-    },
-    # --- v3.2 document extraction tool (§8.5 两步流程) ---
-    {
-        "name": "memoryguard_extract_memories",
-        "description": "Extract memory segments from a source file under an authorized source root (read-only preview). Returns candidate list with kind, risk_level, and preview. Does NOT write to shared memory. Use memoryguard_accept_candidates to write accepted candidates.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "source_path": {"type": "string", "description": "absolute or workspace-relative path to a source file under an authorized source root"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-            "required": ["source_path"],
-        },
-    },
-    {
-        "name": "memoryguard_accept_candidates",
-        "description": "Accept extracted memory candidates through GovernanceEngine and write them to shared memory. Records governed automatic writes plus a DecisionEvent (action=accept_extract). Requires extract_id from a prior extract_memories call and explicit candidate_ids list.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "extract_id": {"type": "string", "description": "extract_id returned by memoryguard_extract_memories preview"},
-                "candidate_ids": {"type": "array", "items": {"type": "string"}, "description": "list of candidate_id values to accept (cannot be empty)"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: default)"},
-            },
-            "required": ["extract_id", "candidate_ids"],
-        },
-    },
-    # --- v3.2 semantic dedup tool ---
-    {
-        "name": "memoryguard_semantic_check",
-        "description": "Check a new text against existing memories for semantic duplicates/conflicts (cross-lingual, paraphrase). Returns similar memories with similarity scores. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "new text to check"},
-                "kind": {"type": "string", "description": "optional kind of the new memory, used for conflict detection"},
-                "threshold": {"type": "number", "description": "similarity threshold (default: 0.85)"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: default)"},
-            },
-            "required": ["text"],
-        },
-    },
-    # --- v3.2 provider adapter tool ---
-    {
-        "name": "memoryguard_provider_install",
-        "description": "Install/repair the provider's global MCP, redirect rules, and supported user-level lifecycle Hook (Claude/Codex/Cursor; TRAE reports MCP+rules fallback). Ensures the trusted Agent has a personal binding unless an explicit shared binding already exists. Requires admin capability; idempotent.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "provider": {"type": "string", "description": "provider name: claude|codex|cursor|trae"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "agent_instance_id": {"type": "string", "description": "trusted Agent identity (normally from MEMORYGUARD_AGENT_ID)"},
-            },
-            "required": ["provider"],
-        },
-    },
-    # --- v3.2 agent group resolution tool ---
-    {
-        "name": "memoryguard_resolve_group",
-        "description": "Resolve which share_group_id an agent should write to, based on its AgentBinding. Read-only. Agents should call this before memory_write to know their group.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "agent_instance_id": {"type": "string", "description": "agent instance ID to resolve"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-            "required": ["agent_instance_id"],
-        },
-    },
-    # --- v3.3 host AI enrichment tools ---
-    {
-        "name": "memoryguard_list_pending_enrichments",
-        "description": "List pending memory enrichment tasks. Skill path: after build_and_enrich returns host_action_required, YOU (host agent) must classify+translate each task and call apply_enrichments — do not ask the user to pick a CLI.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "limit": {"type": "integer", "description": "max tasks to return (default: 50)"},
-                "agent_instance_id": {"type": "string", "description": "filter by agent scope (optional)"},
-                "share_group_id": {"type": "string", "description": "filter by share group scope (optional)"},
-            },
-        },
-    },
-    {
-        "name": "memoryguard_apply_enrichments",
-        "description": "Apply host-agent enrichment results to the V2 memory plane. Each result: task_id, kind, title, body, confidence. After YOU enrich pending tasks, call this then memoryguard_build_and_enrich again to refresh the graph.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "results": {
-                    "type": "array",
-                    "description": "enrichment results to apply",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "task_id": {"type": "string"},
-                            "kind": {"type": "string", "description": "preference|fact|project|procedure|episode|correction"},
-                            "title": {"type": "string", "description": "translated/organized title"},
-                            "body": {"type": "string", "description": "translated/organized body"},
-                            "confidence": {"type": "number", "description": "0.0-1.0"},
-                            "rationale": {"type": "string"},
-                        },
-                        "required": ["task_id", "kind", "title", "body"],
-                    },
-                },
-                "agent_instance_id": {"type": "string", "description": "scope filter (optional)"},
-                "share_group_id": {"type": "string", "description": "share group scope (optional)"},
-            },
-            "required": ["results"],
-        },
-    },
-    {
-        "name": "memoryguard_enrichment_status",
-        "description": "Check enrichment queue status: pending/applied counts. Primary enrich happens inside build_projection; use this to see residuals.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "agent_instance_id": {"type": "string", "description": "filter by agent scope (optional)"},
-                "share_group_id": {"type": "string", "description": "filter by share group (optional)"},
-            },
-        },
-    },
-    # --- v3.3 build projection + auto enrich ---
-    {
-        "name": "memoryguard_build_and_enrich",
-        "description": "Build memory projection. Default enrich_mode=host: YOU are the LLM. If pending_tasks / host_action_required, immediately classify+translate, call apply_enrichments, then call this again. Multi-agent GUI may pass enrich_mode=cli with a chosen Agent CLI. Do not require a separate AI-整理 button.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "agent_instance_id": {"type": "string", "description": "agent instance ID for scoped projection"},
-                "mode": {"type": "string", "description": "projection mode: reconstructed (default) or native"},
-                "share_group_id": {"type": "string", "description": "share group ID (optional)"},
-                "enrich_mode": {"type": "string", "description": "host (default) | cli | auto | heuristic"},
-                "llm_agent": {"type": "string", "description": "CLI agent id when enrich_mode=cli (codex|claude|cursor|…)"},
-                "llm_cli": {"type": "string", "description": "CLI path when enrich_mode=cli"},
-            },
-        },
-    },
-    # --- Req9: governance-degraded read-only diagnostics ---
-    {
-        "name": "memoryguard_canonical_status",
-        "description": (
-            "Read-only canonical reconciliation status for a share_group_id: "
-            "canonical_ready, failures, checks, read_path. Always allowed, "
-            "even when governance is degraded."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: resolved binding or default)"},
-            },
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_diagnostics_snapshot",
-        "description": (
-            "Read-only governance diagnostics snapshot JSON: reconciliation jobs by status, "
-            "canonical activation, projection, source links, bindings. Snapshot uses "
-            "sqlite3.Connection.backup(); never copies DB/WAL files and accepts no "
-            "arbitrary SQL or file paths. Always allowed, even when governance is degraded."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: resolved binding or default)"},
-            },
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_projection_status",
-        "description": (
-            "Read-only projection status (projection_lag / projection_error / scopes) "
-            "for a group. Always allowed, even when governance is degraded."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: resolved binding or default)"},
-            },
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "memoryguard_runtime_processes",
-        "description": (
-            "Read-only runtime process facts: current pid, memoryguard_version, "
-            "code_fingerprint, control_workspace, database_paths, runtime lease status. "
-            "Always allowed, even when governance is degraded."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-            "additionalProperties": False,
-        },
-    },
-]
-
-# V2-native history and knowledge surfaces are described locally so importing
-# the MCP entrypoint cannot pull retired storage adapters into the process.
-_FULL_TOOLS.extend([
-    {
-        "name": "memoryguard_history_search",
-        "description": "Search trusted local history by query. Returns bounded identifiers and summaries, never raw turn bodies.",
-        "inputSchema": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "required full-text query"},
-            "scope": {"type": "object", "description": "optional trusted history scope hint"},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
-            "offset": {"type": "integer", "minimum": 0, "default": 0},
-        }, "required": ["query"]},
-    },
-    {
-        "name": "memoryguard_history_timeline",
-        "description": "Read a bounded metadata-only timeline around one authorized history turn. Does not write long-term memory.",
-        "inputSchema": {"type": "object", "properties": {
-            "session_id": {"type": "string", "description": "authorized session identifier"},
-            "anchor_turn_id": {"type": "string", "description": "authorized anchor turn identifier"},
-            "scope": {"type": "object", "description": "optional trusted history scope hint"},
-            "radius": {"type": "integer", "minimum": 0, "maximum": 50, "default": 4},
-        }, "required": ["session_id", "anchor_turn_id"]},
-    },
-    {
-        "name": "memoryguard_history_read",
-        "description": "Read one explicitly selected authorized history session or turn. Raw content is returned only on this explicit read path.",
-        "inputSchema": {"type": "object", "properties": {
-            "session_id": {"type": "string", "description": "read exactly one session; mutually exclusive with turn_id"},
-            "turn_id": {"type": "string", "description": "read exactly one turn; mutually exclusive with session_id"},
-            "scope": {"type": "object", "description": "optional trusted history scope hint"},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 250, "default": 100},
-            "offset": {"type": "integer", "minimum": 0, "default": 0},
-        }},
-    },
-    {
-        "name": "memoryguard_history_extract_preview",
-        "description": "Preview possible long-term-memory candidates from one authorized history session. Read-only; never writes memory.",
-        "inputSchema": {"type": "object", "properties": {
-            "session_id": {"type": "string", "description": "authorized session identifier"},
-            "turn_ids": {"type": "array", "items": {"type": "string"}, "description": "optional selected turns"},
-            "scope": {"type": "object", "description": "optional trusted history scope hint"},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
-        }, "required": ["session_id"]},
-    },
-])
-_FULL_TOOLS.extend([
-    {
-        "name": "memoryguard_history_list_sessions",
-        "description": "List the trusted Agent's local conversation-history sessions. Read-only; raw text is not returned.",
-        "inputSchema": {"type": "object", "properties": {
-            "scope": {"type": "object"}, "limit": {"type": "integer"},
-            "offset": {"type": "integer"}, "extracted": {"type": "boolean"},
-            "date_from": {"type": "string"}, "date_to": {"type": "string"},
-        }},
-    },
-    {
-        "name": "memoryguard_history_export",
-        "description": "Export explicitly selected sessions owned by the trusted Agent. This is raw-history evidence, not long-term memory.",
-        "inputSchema": {"type": "object", "properties": {
-            "session_ids": {"type": "array", "items": {"type": "string"}},
-            "scope": {"type": "object"},
-        }, "required": ["session_ids"]},
-    },
-    {
-        "name": "memoryguard_history_delete",
-        "description": "Permanently delete explicitly selected raw-history sessions for the trusted Agent. Requires confirmed=true; never deletes long-term memories.",
-        "inputSchema": {"type": "object", "properties": {
-            "session_ids": {"type": "array", "items": {"type": "string"}},
-            "scope": {"type": "object"}, "invalidate_evidence": {"type": "boolean"},
-            "confirmed": {"type": "boolean"},
-        }, "required": ["session_ids", "confirmed"]},
-    },
-])
-
-_FULL_TOOLS.extend([
-    {
-        "name": "memoryguard_knowledge_list",
-        "description": "List bounded reference-only knowledge occurrences in the trusted V2 knowledge scope. Never returns source bodies or writes data.",
-        "inputSchema": {"type": "object", "properties": {
-            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
-            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
-            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
-            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
-        }, "required": ["namespace_id", "sensitivity", "policy_class"]},
-    },
-    {
-        "name": "memoryguard_knowledge_search",
-        "description": "Search reference-only V2 knowledge occurrences in the trusted scope. Returns references and summaries, never source bodies or writes data.",
-        "inputSchema": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "required search text"},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
-            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
-            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
-            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
-        }, "required": ["query", "namespace_id", "sensitivity", "policy_class"]},
-    },
-    {
-        "name": "memoryguard_knowledge_read",
-        "description": "Read one reference-only V2 knowledge occurrence by occurrence_id in the trusted scope. Source body text is never returned and no data is written.",
-        "inputSchema": {"type": "object", "properties": {
-            "occurrence_id": {"type": "string", "description": "required occurrence identifier from a knowledge result"},
-            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
-            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
-            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
-        }, "required": ["occurrence_id", "namespace_id", "sensitivity", "policy_class"]},
-    },
-    {
-        "name": "memoryguard_knowledge_book",
-        "description": "Filter reference-only V2 knowledge occurrences by optional book or occurrence identifier. Returns references only; never source bodies or writes data.",
-        "inputSchema": {"type": "object", "properties": {
-            "book_id": {"type": "string", "description": "optional book or occurrence identifier"},
-            "query": {"type": "string", "description": "optional reference filter"},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
-            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
-            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
-            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
-        }, "required": ["namespace_id", "sensitivity", "policy_class"]},
-    },
-    {
-        "name": "memoryguard_knowledge_candidates",
-        "description": "List reference-only V2 knowledge-review candidates in the trusted scope. Candidate approval remains a governed GUI command; this tool never writes data.",
-        "inputSchema": {"type": "object", "properties": {
-            "status": {"type": "string", "description": "candidate status (default pending)"},
-            "query": {"type": "string", "description": "optional candidate summary/reference filter"},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
-            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
-            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
-            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
-        }, "required": ["namespace_id", "sensitivity", "policy_class"]},
-    },
-])
-
-# ``MCP_TOOL_NAMES`` is the one full callable-name ledger shared with V2
-# dispatch.  The definitions below remain the source of JSON schema and copy;
-# fail at import if either ledger drifts instead of silently exposing a broken
-# or undiscoverable operation.
-TOOL_DEFINITIONS = {
-    str(item["name"]): item
-    for item in _FULL_TOOLS
-    if isinstance(item, dict) and isinstance(item.get("name"), str)
-}
-if len(TOOL_DEFINITIONS) != len(_FULL_TOOLS):
-    raise RuntimeError("mcp_tool_definition_duplicate")
-CALLABLE_TOOL_NAMES = frozenset(TOOL_DEFINITIONS)
-if CALLABLE_TOOL_NAMES != MCP_TOOL_NAMES:
-    missing_definitions = sorted(MCP_TOOL_NAMES - CALLABLE_TOOL_NAMES)
-    extra_definitions = sorted(CALLABLE_TOOL_NAMES - MCP_TOOL_NAMES)
-    raise RuntimeError(
-        "mcp_tool_registry_drift:"
-        f"missing={','.join(missing_definitions)};extra={','.join(extra_definitions)}"
-    )
-if not set(MCP_DEFAULT_PUBLIC_TOOL_NAMES) <= CALLABLE_TOOL_NAMES:
-    raise RuntimeError("mcp_default_tool_not_callable")
-
-# These annotations describe actual public effects, not V2 readiness gates.
-# Bootstrap consumes one pending local CodeGraph receipt when present; all
-# other read tools below use read-only stores/adapters.
-_DEFAULT_TOOL_ANNOTATIONS = {
-    "memoryguard_context_bootstrap": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
-    "memoryguard_memory_search": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
-    "memoryguard_memory_read": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
-    "memoryguard_memory_write": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
-    "memoryguard_memory_update": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
-    "memoryguard_memory_delete": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
-    "memoryguard_memory_status": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
-    "memoryguard_audit": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
-    "memoryguard_explain": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
-}
-if set(_DEFAULT_TOOL_ANNOTATIONS) != set(MCP_DEFAULT_PUBLIC_TOOL_NAMES):
-    raise RuntimeError("mcp_default_tool_annotation_drift")
-for _tool_name, _annotations in _DEFAULT_TOOL_ANNOTATIONS.items():
-    TOOL_DEFINITIONS[_tool_name]["annotations"] = _annotations
-
-# Complete catalog supports older direct calls.  ``TOOLS`` alone is the
-# current discovery surface returned by tools/list for new MCP clients.
-CALLABLE_TOOLS = tuple(_FULL_TOOLS)
-TOOLS = [TOOL_DEFINITIONS[name] for name in MCP_DEFAULT_PUBLIC_TOOL_NAMES]
-
-
-# ---------------------------------------------------------------------------
-# 工具执行
-# ---------------------------------------------------------------------------
-
-
+from .mcp_catalog import (
+    _FULL_TOOLS,
+    _CAPABILITY_QUERY_ALIASES,
+    _DEFAULT_TOOL_ANNOTATIONS,
+    _TASK_MCP_OPERATIONS,
+    TOOL_DEFINITIONS,
+    CALLABLE_TOOL_NAMES,
+    CALLABLE_TOOLS,
+    TOOLS,
+    mcp_capability_catalog,
+)
 def _mcp_error(message: str, *, code: str = "") -> dict[str, Any]:
     """Return a compact MCP error without reflecting caller/exception text."""
     raw = str(message or "").strip()
@@ -1422,7 +224,7 @@ def _get_share_group_id(
 ) -> tuple[str, str | None]:
     """Resolve the active V2 binding; client-selected groups are ignored."""
     from .access_context import load_access_context
-    from .runtime_v2.group_native import GroupControlService
+    from .runtime_v2.group_native import GroupControlError, GroupControlService
 
     if strict is None:
         strict = os.environ.get("MEMORYGUARD_STRICT_BINDING", "") == "1"
@@ -1436,6 +238,24 @@ def _get_share_group_id(
         return "default", None
     try:
         binding = GroupControlService(ws, write=False).active_binding_for_agent(agent_id)
+    except GroupControlError as exc:
+        if strict:
+            return "", "v2_binding_unavailable:" + safe_error_code(
+                getattr(exc, "code", ""), "group_control_failed",
+            )
+        return "default", None
+    except PermissionError as exc:
+        if strict:
+            errno = getattr(exc, "errno", None)
+            suffix = f":errno_{errno}" if isinstance(errno, int) and errno >= 0 else ""
+            return "", "v2_binding_unavailable:permission_denied" + suffix
+        return "default", None
+    except OSError as exc:
+        if strict:
+            errno = getattr(exc, "errno", None)
+            suffix = f":errno_{errno}" if isinstance(errno, int) and errno >= 0 else ""
+            return "", "v2_binding_unavailable:os_error" + suffix
+        return "default", None
     except Exception as exc:
         if strict:
             return "", f"v2_binding_unavailable:{type(exc).__name__}"
@@ -1534,6 +354,14 @@ _V2_STATES = frozenset({"V1_ACTIVE", "V2_BUILDING", "V2_READY", "V2_ACTIVE"})
 _V2_READ_STATES = frozenset({"V2_READY", "V2_ACTIVE"})
 _V2_FACADE_MISSING = object()
 _v2_runtime_facade_factory: Any = None
+# This is set only during serve_stdio.  It contains facades created by that
+# stdio process, never facades owned by another host integration.
+_stdio_owned_facades: list[Any] | None = None
+
+
+def _remember_stdio_facade(facade: Any) -> None:
+    if _stdio_owned_facades is not None and not any(item is facade for item in _stdio_owned_facades):
+        _stdio_owned_facades.append(facade)
 
 _V2_PAYLOAD_IDENTITY_KEYS = frozenset({
     "agent_instance_id", "share_group_id", "workspace", "provider",
@@ -2074,16 +902,53 @@ def _v2_cutover_dispatch(name: str, args: dict[str, Any], workspace: Path) -> di
     facade = _load_v2_runtime_facade(workspace)
     if facade is _V2_FACADE_MISSING:
         return _mcp_json_error(v2_upgrade_payload("UNKNOWN", surface="MCP"))
+    _remember_stdio_facade(facade)
     state, snapshot = _v2_facade_state(facade, workspace)
     if state not in _V2_READ_STATES:
         return _mcp_json_error(v2_upgrade_payload(state, surface="MCP"))
     if name not in CALLABLE_TOOL_NAMES:
         return _mcp_error(f"unknown tool: {name}")
+    # Discovery is pure registry metadata: it remains useful when a local MCP
+    # launch has no active binding or CodeGraph installation.  It still reads
+    # the V2 manifest state above, so an unavailable/old control plane cannot
+    # masquerade as a current capability catalog.
+    if name == "memoryguard_capabilities":
+        try:
+            return _v2_result_envelope(mcp_capability_catalog(args))
+        except ValueError as exc:
+            code = safe_error_code(exc, "invalid_tool_arguments")
+            return _mcp_json_error({"ok": False, "error": code, "code": code})
+    broker_gui_target: tuple[str, dict[str, object]] | None = None
+    if name == "memoryguard_invoke":
+        try:
+            target_surface, target, target_args = resolve_mcp_broker_invocation(
+                args,
+                tool_names=CALLABLE_TOOL_NAMES,
+                mutation_names=_MUTATING_TOOLS,
+                gui_names=MCP_BROKER_GUI_METHOD_NAMES,
+                gui_mutation_names=GUI_MUTATION_NAMES,
+            )
+        except ValueError as exc:
+            code = safe_error_code(exc, "invalid_tool_arguments")
+            return _mcp_json_error({"ok": False, "error": code, "code": code})
+        if target_surface == "mcp":
+            return _v2_cutover_dispatch(target, deepcopy(target_args), workspace)
+        broker_gui_target = (target, target_args)
+        if state == "V2_READY" and target in GUI_MUTATION_NAMES:
+            return _mcp_json_error({"ok": False, "error": "v2_not_active", "code": "v2_not_active"})
     # V2_READY permits reads/bootstrap only; mutations must never touch either
     # port. The imported mutation ledger is the sole classifier.
     if state == "V2_READY" and name in _MUTATING_TOOLS:
         return _mcp_json_error({"ok": False, "error": "v2_not_active", "code": "v2_not_active"})
-    lease_error = _runtime_lease_guard(name, args, workspace)
+    lease_error = _runtime_lease_guard(
+        name,
+        args,
+        workspace,
+        force_write=bool(
+            broker_gui_target is not None
+            and broker_gui_target[0] in GUI_MUTATION_NAMES
+        ),
+    )
     if lease_error is not None:
         return lease_error
     try:
@@ -2109,7 +974,7 @@ def _v2_cutover_dispatch(name: str, args: dict[str, Any], workspace: Path) -> di
         or name.startswith("memoryguard_binding_")
         or name in {"memoryguard_context_bootstrap", "memoryguard_accept_candidates", "memoryguard_external_mcp_import"}
     )
-    if context_error and scoped:
+    if context_error and (scoped or broker_gui_target is not None):
         return _mcp_json_error({"ok": False, "error": context_error, "code": context_error})
     try:
         _validate_v2_scope_arguments(name, args, context)
@@ -2129,6 +994,26 @@ def _v2_cutover_dispatch(name: str, args: dict[str, Any], workspace: Path) -> di
         accepts_snapshot = False
     if not has_context:
         return _mcp_json_error({"ok": False, "error": "v2_context_capability_required", "code": "v2_context_capability_required"})
+    if broker_gui_target is not None:
+        gui_name, gui_args = broker_gui_target
+        gui_dispatch = getattr(facade, "dispatch_gui", None)
+        if not callable(gui_dispatch):
+            return _mcp_json_error({"ok": False, "error": "v2_gui_dispatch_unavailable", "code": "v2_gui_dispatch_unavailable"})
+        try:
+            gui_params = inspect.signature(gui_dispatch).parameters
+            gui_accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in gui_params.values())
+            gui_kwargs: dict[str, Any] = {"context": context}
+            if "snapshot" in gui_params or gui_accepts_kwargs:
+                gui_kwargs["snapshot"] = snapshot
+            result = gui_dispatch(gui_name, deepcopy(gui_args), **gui_kwargs)
+        except Exception as exc:
+            return _mcp_json_error({
+                "ok": False,
+                "error": "v2_dispatch_failed",
+                "code": "v2_dispatch_failed",
+                "diagnostic": safe_exception_diagnostic(exc, code="v2_dispatch_failed"),
+            })
+        return _v2_result_envelope(result)
     try:
         port_args = _v2_port_args(name, args)
     except ValueError as exc:
@@ -2259,7 +1144,13 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _runtime_lease_guard(name: str, args: dict[str, Any], workspace: Path) -> dict[str, Any] | None:
+def _runtime_lease_guard(
+    name: str,
+    args: dict[str, Any],
+    workspace: Path,
+    *,
+    force_write: bool = False,
+) -> dict[str, Any] | None:
     """Fail-closed runtime split-brain guard for DB-writing tools (Req10).
 
     Tools that only read return ``None`` immediately.  For any tool that can
@@ -2271,7 +1162,7 @@ def _runtime_lease_guard(name: str, args: dict[str, Any], workspace: Path) -> di
     conflicting process is never killed.  Returns ``None`` when the lease is
     granted.
     """
-    if name not in _DB_WRITING_TOOLS:
+    if not force_write and name not in _DB_WRITING_TOOLS:
         return None
     from .runtime_lease import check_runtime_lease
 
@@ -2298,28 +1189,42 @@ def serve_stdio() -> int:
     """MCP stdio 主循环。从 stdin 读 JSON-RPC，向 stdout 写响应。"""
     # MCP stdio 协议固定使用 UTF-8。Windows 中文系统的管道默认可能是
     # GBK；工具描述或记忆正文含中文时会让宿主无法解码整条 JSON-RPC。
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
-            reconfigure(encoding="utf-8", errors="strict")
-    # Runtime state is gated per request by execute_tool.  Startup only
-    # configures the stdio encoding and never performs legacy recovery.
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError as e:
-            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"parse error: {e}"}}
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
-            continue
-        response = handle_request(request)
-        if response is not None:
-            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
-    return 0
+    global _stdio_owned_facades
+    previous_owned = _stdio_owned_facades
+    owned: list[Any] = []
+    _stdio_owned_facades = owned
+    try:
+        for stream in (sys.stdin, sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if callable(reconfigure):
+                reconfigure(encoding="utf-8", errors="strict")
+        # Runtime state is gated per request by execute_tool. Startup only
+        # configures encoding and never performs legacy recovery.
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError as e:
+                response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"parse error: {e}"}}
+                sys.stdout.write(json.dumps(response) + "\n")
+                sys.stdout.flush()
+                continue
+            response = handle_request(request)
+            if response is not None:
+                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+        return 0
+    finally:
+        _stdio_owned_facades = previous_owned
+        for facade in owned:
+            shutdown = getattr(facade, "shutdown", None) or getattr(facade, "close", None)
+            if callable(shutdown):
+                try:
+                    shutdown(timeout=5.0)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

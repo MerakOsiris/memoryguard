@@ -3,8 +3,9 @@ from __future__ import annotations
 import threading
 import time
 import os
+import pytest
 
-from memoryguard.runtime_v2.task_coordinator import TaskCoordinator
+from memoryguard.runtime_v2.task_coordinator import TaskCoordinator, TaskCoordinatorError
 from memoryguard.runtime_v2.working_memory import RuntimeScope
 
 
@@ -189,11 +190,165 @@ def test_scope_exclusive_focuses_existing_active_run_and_no_duplicate_worker(tmp
     # 同一 (operation, scope) 的第二次启动聚焦已有任务，绝不创建第二个 worker
     assert second.get("started") is False
     assert second.get("focused") is True
-    assert second.get("code") == "operation_already_active"
+    assert second.get("accepted") is False
+    assert second.get("code") == "operation_busy"
     assert second["task"]["run_id"] == first["task"]["run_id"]
     release.set()
     _wait_terminal(coordinator, first["task"]["run_id"], scope)
     assert calls == 1
+
+
+def test_scope_exclusive_replays_only_matching_request_and_rejects_key_reuse(tmp_path):
+    coordinator = TaskCoordinator(tmp_path)
+    scope = _scope(tmp_path)
+    release = threading.Event()
+
+    def worker(execution):
+        while not release.is_set():
+            execution.check_cancelled()
+            time.sleep(0.01)
+        return {"result_id": "source-a"}
+
+    first = coordinator.start_scope_exclusive(
+        operation="codegraph_build_bound",
+        key="request-a",
+        request={"source_id": "source-a"},
+        scope=scope,
+        worker=worker,
+    )
+    replay = coordinator.start_scope_exclusive(
+        operation="codegraph_build_bound",
+        key="request-a",
+        request={"source_id": "source-a"},
+        scope=scope,
+        worker=worker,
+    )
+    assert replay["accepted"] is True
+    assert replay["reused"] is True
+    assert replay["code"] == "idempotent_replay"
+    assert replay["job_id"] == first["task"]["run_id"]
+
+    with pytest.raises(TaskCoordinatorError, match="idempotency_key_reused"):
+        coordinator.start_scope_exclusive(
+            operation="codegraph_build_bound",
+            key="request-a",
+            request={"source_id": "source-b"},
+            scope=scope,
+            worker=worker,
+        )
+
+    busy = coordinator.start_scope_exclusive(
+        operation="codegraph_build_bound",
+        key="request-b",
+        request={"source_id": "source-b"},
+        scope=scope,
+        worker=worker,
+    )
+    assert busy["accepted"] is False
+    assert busy["code"] == "operation_busy"
+    assert busy["job_id"] == first["task"]["run_id"]
+    release.set()
+    assert _wait_terminal(coordinator, first["task"]["run_id"], scope)["status"] == "succeeded"
+
+
+def test_two_coordinators_start_same_request_only_once(tmp_path):
+    first = TaskCoordinator(tmp_path)
+    second = TaskCoordinator(tmp_path)
+    scope = _scope(tmp_path)
+    gate = threading.Barrier(2)
+    release = threading.Event()
+    worker_started = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+    results = []
+    errors = []
+
+    def worker(execution):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        worker_started.set()
+        while not release.is_set():
+            execution.check_cancelled()
+            time.sleep(0.01)
+        return {"result_id": "one"}
+
+    def start(coordinator):
+        try:
+            gate.wait(timeout=2.0)
+            results.append(coordinator.start_scope_exclusive(
+                operation="codegraph_build_bound",
+                key="shared-request",
+                request={"source_id": "source-a"},
+                scope=scope,
+                worker=worker,
+            ))
+        except BaseException as exc:  # pragma: no cover - assertion guard
+            errors.append(exc)
+
+    threads = [threading.Thread(target=start, args=(coordinator,)) for coordinator in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(3.0)
+    assert not errors
+    assert len(results) == 2
+    assert {result["task"]["run_id"] for result in results} == {results[0]["task"]["run_id"]}
+    assert sum(bool(result.get("started")) for result in results) == 1
+    assert sum(bool(result.get("reused")) for result in results) == 1
+    assert worker_started.wait(1.0)
+    assert calls == 1
+    release.set()
+    assert _wait_terminal(first, results[0]["task"]["run_id"], scope)["status"] == "succeeded"
+
+
+def test_two_coordinators_start_same_key_only_once(tmp_path):
+    first = TaskCoordinator(tmp_path)
+    second = TaskCoordinator(tmp_path)
+    scope = _scope(tmp_path)
+    gate = threading.Barrier(2)
+    release = threading.Event()
+    worker_started = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+    results = []
+    errors = []
+
+    def worker(execution):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        worker_started.set()
+        while not release.is_set():
+            execution.check_cancelled()
+            time.sleep(0.01)
+        return {"result_id": "one"}
+
+    def start(coordinator):
+        try:
+            gate.wait(timeout=2.0)
+            results.append(coordinator.start(
+                operation="knowledge_reingest",
+                idempotency_key="shared-request",
+                request={"book_id": "book-a"},
+                scope=scope,
+                worker=worker,
+            ))
+        except BaseException as exc:  # pragma: no cover - assertion guard
+            errors.append(exc)
+
+    threads = [threading.Thread(target=start, args=(coordinator,)) for coordinator in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(3.0)
+    assert not errors
+    assert len(results) == 2
+    assert {result["task"]["run_id"] for result in results} == {results[0]["task"]["run_id"]}
+    assert worker_started.wait(1.0)
+    assert calls == 1
+    release.set()
+    assert _wait_terminal(first, results[0]["task"]["run_id"], scope)["status"] == "succeeded"
 
 
 def test_active_runs_filters_by_operation(tmp_path):

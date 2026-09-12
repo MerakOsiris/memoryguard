@@ -189,9 +189,18 @@ def codegraph_reference_candidates(
     share_group_id: str,
     provider: str = "",
     runtime_role: str = "",
+    query: str = "",
     limit: int = 1,
-) -> tuple[dict[str, str], ...]:
-    """Read nearest trusted graphify CodeGraph aggregate metadata only."""
+) -> tuple[dict[str, Any], ...]:
+    """Read bounded, trusted CodeGraph references relevant to current task.
+
+    This is metadata-only.  It never builds a graph or traverses arbitrary
+    edges.  The aggregate status remains available as a light signal; symbol
+    references are added only when task terms match indexed production
+    metadata.  A pending incremental receipt is represented as a high-priority
+    reference so ContextEngine budget/receipt handling decides whether it was
+    delivered.
+    """
 
     project = canonical_project_ref(project_ref)
     agent = str(agent_instance_id or "").strip()
@@ -214,9 +223,22 @@ def codegraph_reference_candidates(
             project_ref=project,
             share_group_id=group,
             provider=provider_value,
+            agent_instance_id=agent,
+            runtime_role=runtime_role,
             limit=limit,
         )
-        references: list[dict[str, str]] = []
+        references: list[dict[str, Any]] = []
+        seen_references: set[tuple[str, str]] = set()
+
+        def add_reference(value: dict[str, Any]) -> None:
+            identity = (str(value.get("ref") or ""), str(value.get("hash") or ""))
+            if not identity[0] and not identity[1]:
+                return
+            if identity in seen_references:
+                return
+            seen_references.add(identity)
+            references.append(value)
+
         for row in rows:
             counts = row.get("counts") if isinstance(row.get("counts"), dict) else {}
             files = row.get("files") if isinstance(row.get("files"), list) else []
@@ -248,6 +270,125 @@ def codegraph_reference_candidates(
                 "ref": f"codegraph:{row.get('scope_id', '')}",
                 "hash": digest,
                 "trust": "reference_only",
+                "source": "native-v2-codegraph",
+                "priority": 0,
+            })
+
+        # Resolve the same nearest trusted scopes used by the aggregate query.
+        # Scope resolution enforces workspace/group/agent/provider boundaries;
+        # no caller-controlled scope is accepted from task text.
+        scopes = store.nearest_scopes(
+            project_ref=project,
+            share_group_id=group,
+            agent_instance_id=agent,
+            provider=provider_value,
+            runtime_role=runtime_role,
+            limit=limit,
+        )
+        terms = sorted(
+            (item for item in _tokens(query) if len(item) >= 2),
+            key=lambda item: (-len(item), item),
+        )[:8]
+        seen_symbols: set[str] = set()
+        pending_receipt: dict[str, Any] | None = None
+        for scope in scopes:
+            files_by_id: dict[str, str] | None = None
+            for term in terms:
+                try:
+                    symbols = store.query_symbols(
+                        term,
+                        scope=scope,
+                        provenance="production",
+                        limit=max(1, min(limit, 8)),
+                    )
+                except Exception:
+                    # An aggregate status is still safe and useful when a
+                    # symbol query is unavailable or an old schema is partial.
+                    continue
+                for symbol in symbols:
+                    if symbol.symbol_id in seen_symbols:
+                        continue
+                    seen_symbols.add(symbol.symbol_id)
+                    source_map = symbol.source_map if isinstance(symbol.source_map, dict) else {}
+                    path = str(source_map.get("path") or "")
+                    if not path:
+                        try:
+                            if files_by_id is None:
+                                files_by_id = {
+                                    item.file_id: item.path
+                                    for item in store.list_source_files(scope=scope)
+                                }
+                            path = str(files_by_id.get(symbol.file_id) or "")
+                        except Exception:
+                            path = ""
+                    location = f"L{symbol.line_start}"
+                    if symbol.line_end and symbol.line_end != symbol.line_start:
+                        location += f"-L{symbol.line_end}"
+                    summary = (
+                        f"CodeGraph symbol {symbol.name} ({symbol.kind}) "
+                        f"at {path}:{location}"
+                    )
+                    add_reference({
+                        "summary": summary[:1200],
+                        "ref": f"codegraph:symbol:{symbol.symbol_id}",
+                        "hash": stable_hash(
+                            "codegraph-symbol",
+                            symbol.symbol_id,
+                            symbol.symbol_hash,
+                            path,
+                            location,
+                        ),
+                        "trust": "reference_only",
+                        "source": "native-v2-codegraph",
+                        "priority": 20,
+                    })
+
+            # Receipt delivery is one item per bootstrap across all eligible
+            # scopes.  Scopes are already deterministically nearest-first; the
+            # first valid pending receipt wins so one packet cannot expose
+            # several receipts while native dispatch consumes only one.
+            if pending_receipt is None:
+                try:
+                    candidate_receipt = store.peek_affected_receipt(scope=scope)
+                except Exception:
+                    candidate_receipt = None
+                if candidate_receipt:
+                    receipt_id = str(candidate_receipt.get("receipt_id") or "")
+                    digest = str(candidate_receipt.get("digest") or "")
+                    if receipt_id and digest:
+                        pending_receipt = candidate_receipt
+
+        if pending_receipt:
+            receipt = pending_receipt
+            receipt_id = str(receipt.get("receipt_id") or "")
+            digest = str(receipt.get("digest") or "")
+            result_count = len(receipt.get("result_ids") or ())
+            start_count = len(receipt.get("start_ids") or ())
+            result_ids = tuple(
+                str(item).strip()
+                for item in (receipt.get("result_ids") or ())
+                if str(item).strip()
+            )[:32]
+            start_ids = tuple(
+                str(item).strip()
+                for item in (receipt.get("start_ids") or ())
+                if str(item).strip()
+            )[:8]
+            affected_ids = ", ".join(result_ids or start_ids)
+            if len(affected_ids) > 760:
+                affected_ids = affected_ids[:757] + "..."
+            add_reference({
+                "summary": (
+                    f"CodeGraph affected update: {result_count} symbols "
+                    f"from {start_count} changed roots, depth "
+                    f"{int(receipt.get('depth') or 0)}; changed/affected IDs: "
+                    f"{affected_ids}"
+                ),
+                "ref": f"codegraph:affected:{receipt_id}",
+                "hash": digest,
+                "trust": "reference_only",
+                "source": "native-v2-codegraph",
+                "priority": 100,
             })
         return tuple(references)
     except Exception:
@@ -258,6 +399,7 @@ def consume_codegraph_affected_receipt(
     workspace: str | Path,
     *,
     scope: Any,
+    receipt_id: str = "",
 ) -> dict[str, Any] | None:
     """Consume one already-bounded incremental CodeGraph receipt.
 
@@ -269,9 +411,43 @@ def consume_codegraph_affected_receipt(
     try:
         from .codegraph_v2.store import CodeGraphStore
 
-        return CodeGraphStore(workspace, initialize=False).consume_affected_receipt(
-            scope=scope,
-        )
+        store = CodeGraphStore(workspace, initialize=False)
+        expected = str(receipt_id or "").strip()
+        # The current transport scope may be a caller/provider tuple while a
+        # GUI Graphify build is persisted at trusted group scope.  Resolve
+        # only store-owned nearest scopes for the same project/group and try
+        # the exact receipt ID; never accept a scope from request payload.
+        scopes: list[Any] = [scope]
+        if expected:
+            try:
+                scope_value = scope.to_dict() if hasattr(scope, "to_dict") else dict(scope)
+                nearest = store.nearest_scopes(
+                    project_ref=str(scope_value.get("project_ref") or ""),
+                    share_group_id=str(scope_value.get("share_group_id") or ""),
+                    agent_instance_id=str(scope_value.get("agent_instance_id") or ""),
+                    provider=str(scope_value.get("provider") or ""),
+                    runtime_role=str(scope_value.get("runtime_role") or ""),
+                    limit=4,
+                )
+                scopes.extend(nearest)
+            except Exception:
+                pass
+        seen_scopes: set[str] = set()
+        for candidate_scope in scopes:
+            try:
+                scope_key = str(getattr(candidate_scope, "digest", "")) or repr(candidate_scope)
+                if scope_key in seen_scopes:
+                    continue
+                seen_scopes.add(scope_key)
+                receipt = store.consume_affected_receipt(
+                    scope=candidate_scope,
+                    receipt_id=expected,
+                )
+                if receipt:
+                    return receipt
+            except Exception:
+                continue
+        return None
     except Exception:
         return None
 
@@ -335,6 +511,7 @@ def unified_reference_candidates(
                 share_group_id=share_group_id,
                 provider=provider,
                 runtime_role=runtime_role,
+                query=query,
                 limit=min(limit, 4),
             ),
         ),

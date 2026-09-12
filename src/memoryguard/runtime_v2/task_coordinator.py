@@ -8,6 +8,7 @@ in-memory job dictionary.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -17,6 +18,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from ..governance_lock import GovernanceLockError, WorkspaceGovernanceLock
 from .working_memory import MutationContext, RuntimeScope, RuntimeStore, RuntimeV2Error, TaskRun
 
 
@@ -26,6 +28,10 @@ class TaskCancelled(RuntimeError):
 
 class TaskCoordinatorError(RuntimeError):
     """Task scheduling, cancellation, or durable state transition failed."""
+
+    def __init__(self, code: str) -> None:
+        self.code = str(code or "task_coordinator_failed")
+        super().__init__(self.code)
 
 
 def _stable_run_id(operation: str, idempotency_key: str, scope: RuntimeScope) -> str:
@@ -40,6 +46,17 @@ def _stable_run_id(operation: str, idempotency_key: str, scope: RuntimeScope) ->
         separators=(",", ":"),
     )
     return "gui-task-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _request_fingerprint(request: Any) -> str:
+    """Hash scheduling intent without retaining user/source payloads."""
+    if request is None:
+        return ""
+    try:
+        raw = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError) as exc:
+        raise TaskCoordinatorError("task_request_invalid") from exc
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _safe_error(exc: BaseException) -> dict[str, Any]:
@@ -124,8 +141,18 @@ class TaskCoordinator:
         self.workspace = Path(workspace).expanduser().resolve()
         self._write_store: RuntimeStore | None = None
         self._lock = threading.RLock()
+        self._scheduling_lock = WorkspaceGovernanceLock(self.workspace)
         self._workers: dict[str, _WorkerHandle] = {}
         self._closed = False
+
+    @contextmanager
+    def _scheduling_guard(self):
+        """Serialize durable run creation and worker ownership across hosts."""
+        try:
+            with self._scheduling_lock:
+                yield
+        except GovernanceLockError as exc:
+            raise TaskCoordinatorError("task_scheduling_lock_unavailable") from exc
 
     def _writer(self) -> RuntimeStore:
         with self._lock:
@@ -220,6 +247,7 @@ class TaskCoordinator:
         worker: Callable[[TaskExecution], Mapping[str, Any] | None],
         goal: str | None = None,
         importance: int = 0,
+        request: Any = None,
     ) -> dict[str, Any]:
         if self._closed:
             raise TaskCoordinatorError("task coordinator is closed")
@@ -230,9 +258,11 @@ class TaskCoordinator:
         if not operation_text or not key:
             raise TaskCoordinatorError("operation and idempotency_key are required")
         run_id = _stable_run_id(operation_text, key, scope)
-        with self._lock:
+        fingerprint = _request_fingerprint(request)
+        with self._scheduling_guard(), self._lock:
             existing = self._reader().get_run(run_id, scope)
             if existing is not None:
+                self._assert_request_replay(run_id, scope, fingerprint)
                 return self.status(run_id, scope)
             self._schedule(
                 operation=operation_text,
@@ -241,6 +271,7 @@ class TaskCoordinator:
                 worker=worker,
                 goal=goal,
                 importance=importance,
+                request_fingerprint=fingerprint,
             )
         return self.status(run_id, scope)
 
@@ -253,6 +284,7 @@ class TaskCoordinator:
         goal: str | None = None,
         importance: int = 0,
         key: str | None = None,
+        request: Any = None,
     ) -> dict[str, Any]:
         """Start one worker per (operation, scope).
 
@@ -273,9 +305,22 @@ class TaskCoordinator:
             key = f"{operation_text}:{time.time_ns()}"
         key = str(key)
         run_id = _stable_run_id(operation_text, key, scope)
-        with self._lock:
+        fingerprint = _request_fingerprint(request)
+        with self._scheduling_guard(), self._lock:
             if self._closed:
                 raise TaskCoordinatorError("task coordinator closed during scheduling")
+            existing = self._reader().get_run(run_id, scope)
+            if existing is not None:
+                self._assert_request_replay(run_id, scope, fingerprint)
+                replay = self.status(run_id, scope)
+                replay.update({
+                    "started": False,
+                    "reused": True,
+                    "accepted": True,
+                    "code": "idempotent_replay",
+                    "job_id": run_id,
+                })
+                return replay
             active = self._reader().list_runs(
                 scope,
                 states=("queued", "running"),
@@ -288,7 +333,8 @@ class TaskCoordinator:
                     focused.update({
                         "started": False,
                         "focused": True,
-                        "code": "operation_already_active",
+                        "accepted": False,
+                        "code": "operation_busy",
                         "job_id": item.run_id,
                     })
                     return focused
@@ -309,10 +355,21 @@ class TaskCoordinator:
                 worker=worker,
                 goal=goal,
                 importance=importance,
+                request_fingerprint=fingerprint,
             )
         result = self.status(run_id, scope)
         result["started"] = True
+        result["accepted"] = True
         return result
+
+    def _assert_request_replay(
+        self, run_id: str, scope: RuntimeScope, fingerprint: str,
+    ) -> None:
+        if not fingerprint:
+            return
+        persisted = self._reader().request_fingerprint(run_id, scope)
+        if not persisted or persisted != fingerprint:
+            raise TaskCoordinatorError("idempotency_key_reused")
 
     def active_runs(self, scope: RuntimeScope, *, operation: str | None = None, limit: int = 100) -> list[str]:
         """Run ids of ``queued``/``running`` runs in the exact trusted scope.
@@ -338,6 +395,7 @@ class TaskCoordinator:
         worker: Callable[[TaskExecution], Mapping[str, Any] | None],
         goal: str | None = None,
         importance: int = 0,
+        request_fingerprint: str = "",
     ) -> None:
         """Create the durable run and start its worker thread.
 
@@ -355,6 +413,7 @@ class TaskCoordinator:
             importance=int(importance),
             mutation=self._mutation(scope, f"{run_id}:create"),
             requested_by="gui",
+            request_fingerprint=request_fingerprint,
         )
         self._record_owner(run_id, scope)
         cancel_event = threading.Event()
