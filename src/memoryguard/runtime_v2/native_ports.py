@@ -31,9 +31,13 @@ from ..cutover_v2.surfaces import (
     GUI_MUTATION_NAMES,
     GUI_METHOD_NAMES,
     GUI_OPERATION_SPECS,
+    GUI_MUTATION_NAMES,
+    MCP_BROKER_GUI_METHOD_NAMES,
+    MCP_GUI_BRIDGE_OPERATIONS,
     MCP_MUTATION_NAMES,
     MCP_TOOL_NAMES,
     get_gui_operation_spec,
+    resolve_mcp_broker_invocation,
 )
 from ..rule_read_path import normalize_canonical_read_path
 from ..rule_scope import canonical_project_ref
@@ -142,6 +146,7 @@ _NEUTRAL_MCP_READS = frozenset({
     "memoryguard_diagnostics_snapshot",
     "memoryguard_projection_status",
     "memoryguard_runtime_processes",
+    "memoryguard_capabilities",
 })
 
 
@@ -855,6 +860,20 @@ class NativeV2RuntimePort:
         "memoryguard_codegraph_explain": ("codegraph_explain", "implemented", False),
         "memoryguard_codegraph_affected": ("codegraph_affected", "implemented", False),
         "memoryguard_codegraph_update": ("codegraph_update", "implemented", True),
+        "memoryguard_capabilities": ("mcp_capabilities", "implemented", False),
+        "memoryguard_invoke": ("mcp_invoke", "implemented", False),
+        "memoryguard_knowledge_add": ("mcp_gui_bridge", "implemented", True),
+        "memoryguard_knowledge_reingest": ("mcp_gui_bridge", "implemented", True),
+        "memoryguard_knowledge_rebuild_smart": ("mcp_gui_bridge", "implemented", True),
+        "memoryguard_knowledge_remove": ("mcp_gui_bridge", "implemented", True),
+        "memoryguard_knowledge_restore": ("mcp_gui_bridge", "implemented", True),
+        "memoryguard_knowledge_purge_deleted": ("mcp_gui_bridge", "implemented", True),
+        "memoryguard_knowledge_update_settings": ("mcp_gui_bridge", "implemented", True),
+        "memoryguard_knowledge_candidate_review": ("mcp_gui_bridge", "implemented", True),
+        "memoryguard_task_status": ("mcp_gui_bridge", "implemented", False),
+        "memoryguard_task_list": ("mcp_gui_bridge", "implemented", False),
+        "memoryguard_task_cancel": ("mcp_gui_bridge", "implemented", True),
+        "memoryguard_codegraph_build_bound": ("codegraph_build_bound", "implemented", True),
         "memoryguard_semantic_check": ("semantic_check", "implemented", False),
         "memoryguard_provider_install": ("provider_install", "implemented", True),
         "memoryguard_codegraph_status": ("codegraph_status", "implemented", False),
@@ -2746,12 +2765,30 @@ class NativeV2RuntimePort:
         try:
             from ..context_bootstrap import consume_codegraph_affected_receipt
 
-            receipt = consume_codegraph_affected_receipt(
-                self.workspace,
-                scope=self._codegraph_scope(context),
-            )
-            if receipt:
-                payload["codegraph_affected"] = receipt
+            # The receipt is offered to ContextEngine as a reference-only
+            # candidate.  Consume only when the active packet reports that
+            # exact candidate as a successful hit; budget rejection, blocked
+            # bootstrap, shadow state, or re-entry must leave it pending.
+            receipt_id = ""
+            if str(payload.get("status") or "") == "ok":
+                for item in payload.get("receipts") or ():
+                    if not isinstance(item, Mapping) or item.get("hit") is not True:
+                        continue
+                    if str(item.get("layer") or "") != "reference_only":
+                        continue
+                    item_id = _text(item.get("item_id"))
+                    marker = "codegraph:affected:"
+                    if marker in item_id:
+                        receipt_id = item_id.rsplit(marker, 1)[-1]
+                        break
+            if receipt_id:
+                receipt = consume_codegraph_affected_receipt(
+                    self.workspace,
+                    scope=self._codegraph_scope(context),
+                    receipt_id=receipt_id,
+                )
+                if receipt:
+                    payload["codegraph_affected"] = receipt
         except Exception:
             pass
         return payload
@@ -2956,6 +2993,7 @@ class NativeV2RuntimePort:
                     provider=provider,
                     share_group_id=group,
                     runtime_role=runtime_role,
+                    query=query,
                     limit=min(limit, 4),
                 ),
             ),
@@ -2997,6 +3035,12 @@ class NativeV2RuntimePort:
                     "trust": "reference_only",
                     "source": f"native-v2-{channel}",
                     "id": f"{channel}:{reference or digest}",
+                    "priority": (
+                        int(value.get("priority"))
+                        if isinstance(value.get("priority"), int)
+                        and not isinstance(value.get("priority"), bool)
+                        else 0
+                    ),
                 })
         return references, omissions
 
@@ -4013,11 +4057,92 @@ class NativeV2RuntimePort:
             if isinstance(result, Mapping):
                 return {
                     **dict(result),
-                    "accepted": True,
+                    "accepted": bool(result.get("accepted", True)),
                     "job_id": task.get("run_id", ""),
                     "deferred": True,
                 }
         return result
+
+    @staticmethod
+    def _mcp_mutation_proof(payload: Mapping[str, Any]) -> None:
+        """Require the same explicit retry proof on direct bridge calls."""
+
+        if payload.get("confirmed") is not True:
+            raise NativePortError("confirmation_required")
+        key = _text(payload.get("idempotency_key"))
+        if not key or len(key) > 256:
+            raise NativePortError("idempotency_key_required")
+
+    def _mcp_capabilities(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        **_: Any,
+    ) -> Any:
+        """Direct-native counterpart of registry-only MCP discovery."""
+
+        del context
+        from ..mcp_catalog import mcp_capability_catalog
+
+        try:
+            return mcp_capability_catalog(payload)
+        except ValueError as exc:
+            raise NativePortError(_text(exc) or "capability_pagination_invalid") from exc
+
+    def _mcp_invoke(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        generation: int,
+        state: Any = None,
+        **_: Any,
+    ) -> Any:
+        """Dispatch one registered MCP target through its ordinary native gate."""
+
+        try:
+            target_surface, target, arguments = resolve_mcp_broker_invocation(
+                payload,
+                tool_names=MCP_TOOL_NAMES,
+                mutation_names=MCP_MUTATION_NAMES,
+                gui_names=MCP_BROKER_GUI_METHOD_NAMES,
+                gui_mutation_names=GUI_MUTATION_NAMES,
+            )
+        except ValueError as exc:
+            raise NativePortError(_text(exc) or "broker_operation_invalid") from exc
+        dispatch = self.dispatch_mcp if target_surface == "mcp" else self.dispatch_gui
+        nested = dispatch(target, arguments, context=context, generation=generation, state=state)
+        if nested.get("ok") is False:
+            raise NativePortError(_text(nested.get("code") or nested.get("error")) or "broker_target_failed")
+        return nested.get("data", nested)
+
+    def _mcp_gui_bridge(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        public_name: str = "",
+        **_: Any,
+    ) -> Any:
+        """Reuse only explicitly mapped, scope-safe GUI business commands."""
+
+        gui_name = MCP_GUI_BRIDGE_OPERATIONS.get(public_name)
+        operation = get_gui_operation_spec(gui_name or "")
+        if operation is None:
+            raise NativePortError("broker_operation_unknown")
+        if operation.mutation:
+            self._mcp_mutation_proof(payload)
+        if operation.native_handler == "gui_knowledge_command":
+            return self._gui_knowledge_command(
+                payload, context, operation=operation.canonical_name,
+            )
+        if operation.native_handler == "gui_task_status":
+            return self._gui_task_status(payload, context)
+        if operation.native_handler == "gui_task_list":
+            return self._gui_task_list(payload, context)
+        if operation.native_handler == "gui_task_cancel":
+            return self._gui_task_cancel(payload, context)
+        raise NativePortError("broker_operation_unavailable")
 
     def _gui_projection_query(
         self,
@@ -4103,6 +4228,7 @@ class NativeV2RuntimePort:
                     scope=task_scope,
                     worker=worker,
                     goal="background_task",
+                    request=payload,
                 )
                 task = dict(accepted.get("task") or {})
                 return {
@@ -5322,6 +5448,33 @@ class NativeV2RuntimePort:
                     "runtime_role": selected["runtime_role"],
                     "trusted_context": True,
                 })
+            requested_source = _text(codegraph_source_id)
+            if requested_source:
+                from .source_control import SourceControlError, SourceControlService
+
+                try:
+                    project, source_kind = SourceControlService(self.workspace).resolve_root(
+                        requested_source, context,
+                    )
+                except SourceControlError as exc:
+                    raise NativePortError(exc.code) from exc
+                if source_kind not in {"selected_directory", "obsidian_vault"} or not project.is_dir():
+                    raise NativePortError("codegraph_directory_source_required")
+                canonical = canonical_project_ref(project)
+                if not canonical:
+                    raise NativePortError("codegraph_project_path_invalid")
+                trusted_project = canonical_project_ref(_text(authority.project_ref))
+                if trusted_project and not self._codegraph_project_contains(trusted_project, canonical):
+                    raise NativePortError("codegraph_project_scope_mismatch")
+                return CodeGraphScope.from_value({
+                    "workspace_id": self.workspace,
+                    "share_group_id": authority.share_group_id,
+                    "agent_instance_id": authority.agent_instance_id,
+                    "project_ref": canonical,
+                    "provider": authority.provider,
+                    "runtime_role": authority.runtime_role,
+                    "trusted_context": True,
+                })
             # GUI Graphify builds are persisted as trusted group-level scopes,
             # often for a repository nested below the caller's current
             # project.  Exact Agent/provider lookup would return a valid but
@@ -5368,6 +5521,13 @@ class NativeV2RuntimePort:
             raise
         except Exception as exc:
             raise NativePortError("codegraph_trusted_scope_required") from exc
+
+    @staticmethod
+    def _codegraph_project_contains(parent: str, child: str) -> bool:
+        try:
+            return Path(child).resolve().is_relative_to(Path(parent).resolve())
+        except (OSError, ValueError):
+            return False
 
     def _codegraph_projects(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         del payload
@@ -5430,10 +5590,28 @@ class NativeV2RuntimePort:
         except Exception as exc:
             raise NativePortError("codegraph_project_path_invalid") from exc
 
+        return self._start_codegraph_build(
+            payload, context, source_id=source_id, project=project,
+            canonical=canonical, scope=scope, operation="codegraph_build",
+        )
+
+    def _start_codegraph_build(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        source_id: str,
+        project: Path,
+        canonical: str,
+        scope: Any,
+        operation: str,
+    ) -> Any:
+        """Queue metadata-only Graphify export after source/scope authorization."""
+
         task_scope = self._gui_task_scope(context)
         key = self._gui_task_key(
-            "codegraph_build",
-            {"source_id": source_id, "project_ref": canonical, "nonce": os.urandom(12).hex()},
+            operation,
+            {"source_id": source_id, "project_ref": canonical, "idempotency_key": payload.get("idempotency_key")},
         )
 
         def worker(execution: Any) -> Mapping[str, Any]:
@@ -5460,7 +5638,7 @@ class NativeV2RuntimePort:
                 imported = GraphifyExportAdapter(store).project(export, scope=scope, full_snapshot=True)
                 execution.progress(96, "codegraph_save", item_count=int(imported.counts.get("symbols", 0)))
                 return {
-                    "operation": "codegraph_build",
+                    "operation": operation,
                     "status": "succeeded",
                     "code": "ok",
                     "project_label": project.name,
@@ -5478,21 +5656,74 @@ class NativeV2RuntimePort:
                 ) from exc
 
         accepted = self._task_service().start_scope_exclusive(
-            operation="codegraph_build",
+            operation=operation,
             scope=task_scope,
             worker=worker,
             goal="background_task",
             key=key,
+            request={"source_id": source_id, "project_ref": canonical},
         )
         task = dict(accepted.get("task") or {})
-        return {
+        result = {
             **accepted,
-            "accepted": True,
             "job_id": task.get("run_id", ""),
             "deferred": True,
-            "source_id": source_id,
-            "project_ref": canonical,
         }
+        if accepted.get("accepted", True):
+            result.update({"source_id": source_id, "project_ref": canonical})
+        else:
+            result.update({"requested_source_id": source_id, "requested_project_ref": canonical})
+        return result
+
+    def _codegraph_build_bound(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        """Build one source into exact MCP caller scope, never global GUI scope."""
+
+        self._mcp_mutation_proof(payload)
+        authority = resolve_native_transport_context(context)
+        source_id = _text(payload.get("source_id"))
+        if not source_id:
+            raise NativePortError("codegraph_source_id_required")
+        try:
+            from ..codegraph_v2 import CodeGraphScope
+            from ..codegraph_v2.store import _assert_no_reparse
+            from ..codegraph_v2.graphify_adapter import GraphifyCapability
+            from .source_control import SourceControlError, SourceControlService
+
+            try:
+                project, source_kind = SourceControlService(self.workspace).resolve_root(source_id, context)
+            except SourceControlError as exc:
+                raise NativePortError(exc.code) from exc
+            if source_kind not in {"selected_directory", "obsidian_vault"} or not project.is_dir():
+                raise NativePortError("codegraph_directory_source_required")
+            _assert_no_reparse(project)
+            canonical = canonical_project_ref(project)
+            if not canonical:
+                raise NativePortError("codegraph_project_path_invalid")
+            trusted_project = canonical_project_ref(_text(authority.project_ref))
+            if trusted_project and not self._codegraph_project_contains(trusted_project, canonical):
+                raise NativePortError("codegraph_project_scope_mismatch")
+            if not all((_text(authority.share_group_id), _text(authority.agent_instance_id), _text(authority.provider))):
+                raise NativePortError("codegraph_trusted_scope_required")
+            capability = GraphifyCapability.detect()
+            if not capability.available or not capability.metadata_export:
+                raise NativePortError(capability.code or "graphify_metadata_export_unavailable")
+            scope = CodeGraphScope.from_value({
+                "workspace_id": self.workspace,
+                "share_group_id": authority.share_group_id,
+                "agent_instance_id": authority.agent_instance_id,
+                "project_ref": canonical,
+                "provider": authority.provider,
+                "runtime_role": authority.runtime_role,
+                "trusted_context": True,
+            })
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError("codegraph_project_path_invalid") from exc
+        return self._start_codegraph_build(
+            payload, context, source_id=source_id, project=project,
+            canonical=canonical, scope=scope, operation="codegraph_build_bound",
+        )
 
     @staticmethod
     def _codegraph_bounded_int(value: Any, *, default: int, minimum: int, maximum: int, code: str) -> int:
@@ -5510,7 +5741,9 @@ class NativeV2RuntimePort:
         query = _text(payload.get("query") or payload.get("q"))
         if not query:
             raise NativePortError("codegraph_query_required")
-        scope = self._codegraph_scope(context)
+        scope = self._codegraph_scope(
+            context, codegraph_source_id=_text(payload.get("codegraph_source_id") or payload.get("source_id")),
+        )
         limit = self._codegraph_bounded_int(payload.get("limit"), default=100, minimum=1, maximum=1000, code="codegraph_limit_invalid")
         provenance = _text(payload.get("provenance"))
         try:
@@ -5535,7 +5768,9 @@ class NativeV2RuntimePort:
         end_id = _text(payload.get("end_id"))
         if not start_id or not end_id:
             raise NativePortError("codegraph_path_endpoints_required")
-        scope = self._codegraph_scope(context)
+        scope = self._codegraph_scope(
+            context, codegraph_source_id=_text(payload.get("codegraph_source_id") or payload.get("source_id")),
+        )
         depth = self._codegraph_bounded_int(payload.get("max_depth"), default=8, minimum=1, maximum=32, code="codegraph_depth_invalid")
         try:
             store = self._domain_store("codegraph")
@@ -5559,7 +5794,9 @@ class NativeV2RuntimePort:
         symbol_id = _text(payload.get("symbol_id") or payload.get("id"))
         if not symbol_id:
             raise NativePortError("codegraph_symbol_id_required")
-        scope = self._codegraph_scope(context)
+        scope = self._codegraph_scope(
+            context, codegraph_source_id=_text(payload.get("codegraph_source_id") or payload.get("source_id")),
+        )
         edge_limit = self._codegraph_bounded_int(payload.get("edge_limit"), default=50, minimum=1, maximum=200, code="codegraph_limit_invalid")
         try:
             store = self._domain_store("codegraph")
@@ -5581,7 +5818,9 @@ class NativeV2RuntimePort:
         start_id = _text(payload.get("start_id") or payload.get("symbol_id"))
         if not start_id:
             raise NativePortError("codegraph_start_id_required")
-        scope = self._codegraph_scope(context)
+        scope = self._codegraph_scope(
+            context, codegraph_source_id=_text(payload.get("codegraph_source_id") or payload.get("source_id")),
+        )
         depth = self._codegraph_bounded_int(payload.get("depth"), default=2, minimum=0, maximum=32, code="codegraph_depth_invalid")
         limit = self._codegraph_bounded_int(payload.get("limit"), default=100, minimum=1, maximum=10_000, code="codegraph_limit_invalid")
         try:
@@ -5611,7 +5850,10 @@ class NativeV2RuntimePort:
         full_snapshot = payload.get("full_snapshot")
         if full_snapshot is not None and not isinstance(full_snapshot, bool):
             raise NativePortError("codegraph_full_snapshot_invalid")
-        scope = self._codegraph_scope(context)
+        scope = self._codegraph_scope(
+            context,
+            codegraph_source_id=_text(payload.get("codegraph_source_id") or payload.get("source_id")),
+        )
         try:
             from ..codegraph_v2.graphify_adapter import GraphifyCapabilityError, GraphifyExportAdapter, GraphifyExportError
 
@@ -8486,6 +8728,9 @@ class NativeV2RuntimePort:
             "knowledge_read": self._knowledge_read,
             "knowledge_book": self._knowledge_book,
             "knowledge_candidates": self._knowledge_candidates,
+            "mcp_capabilities": self._mcp_capabilities,
+            "mcp_invoke": self._mcp_invoke,
+            "mcp_gui_bridge": self._mcp_gui_bridge,
             "gui_knowledge_query": self._gui_knowledge_query,
             "gui_knowledge_command": self._gui_knowledge_command,
             "gui_projection_query": self._gui_projection_query,
@@ -8515,6 +8760,7 @@ class NativeV2RuntimePort:
             "codegraph_graph": self._codegraph_graph,
             "codegraph_projects": self._codegraph_projects,
             "codegraph_build": self._codegraph_build,
+            "codegraph_build_bound": self._codegraph_build_bound,
             "codegraph_query": self._codegraph_query,
             "codegraph_path": self._codegraph_path,
             "codegraph_explain": self._codegraph_explain,

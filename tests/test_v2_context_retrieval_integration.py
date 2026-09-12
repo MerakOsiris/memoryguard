@@ -10,6 +10,7 @@ import pytest
 
 from memoryguard.access_context import AccessContext
 from memoryguard.codegraph_v2 import CodeGraphScope, CodeGraphStore, normalize_relative_path
+from memoryguard.codegraph_v2.refresh import apply_incremental_refresh
 from memoryguard.content import ContentStore
 from memoryguard.content.conversation_sync import ConversationEvent, ConversationSync
 from memoryguard.evidence import EvidenceStore
@@ -153,6 +154,46 @@ def _seed_codegraph(root: Path) -> None:
             "provenance": "production",
         }],
     )
+
+
+def _seed_pending_codegraph_receipt(root: Path) -> tuple[CodeGraphStore, CodeGraphScope]:
+    source = root / "src" / "Worker.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("class Worker:\n    pass\n", encoding="utf-8")
+    scope = CodeGraphScope(
+        workspace_id=str(root.resolve()),
+        agent_instance_id="",
+        project_ref=_project(root),
+        provider="graphify",
+        share_group_id="group-a",
+        runtime_role="",
+    )
+    graph = CodeGraphStore(root)
+    graph.upsert_source_file(
+        "src/Worker.py",
+        "before-refresh",
+        scope=scope,
+        symbols=[{
+            "id": "worker-symbol",
+            "name": "Worker",
+            "kind": "class",
+            "signature": "class Worker",
+            "provenance": "production",
+        }],
+    )
+    source.write_text(
+        "class Worker:\n    pass\n\nclass Changed:\n    pass\n",
+        encoding="utf-8",
+    )
+    result = apply_incremental_refresh(
+        graph,
+        scope=scope,
+        source_root=root,
+        relative_paths=["src/Worker.py"],
+    )
+    assert result["status"] == "updated"
+    assert graph.peek_affected_receipt(scope=scope) is not None
+    return graph, scope
 
 
 def test_codegraph_status_resolves_trusted_group_indexed_child_from_parent_project(
@@ -479,6 +520,154 @@ def test_bootstrap_retrieves_five_context_classes_as_bounded_reference_data(tmp_
     assert "Worker" in references and "src/Worker.py" in references and "worker-hash" in references
     assert "raw body" not in references
     assert all(set(item) <= {"summary", "ref", "hash", "trust"} for item in data["reference_only"])
+
+
+def test_codegraph_reference_candidates_match_task_symbols_only(tmp_path: Path) -> None:
+    _seed_codegraph(tmp_path)
+    from memoryguard.context_bootstrap import codegraph_reference_candidates
+
+    common = {
+        "workspace": tmp_path,
+        "agent_instance_id": "agent-a",
+        "project_ref": _project(tmp_path),
+        "share_group_id": "group-a",
+        "provider": "codex",
+        "runtime_role": "root",
+        "limit": 4,
+    }
+    matching = codegraph_reference_candidates(query="Worker", **common)
+    assert any(
+        item["ref"] == "codegraph:symbol:worker-symbol"
+        and "src/Worker.py" in item["summary"]
+        for item in matching
+    )
+    unrelated = codegraph_reference_candidates(query="Database", **common)
+    assert not any(item["ref"].startswith("codegraph:symbol:") for item in unrelated)
+
+
+def test_affected_receipt_is_delivered_once_and_stays_pending_when_omitted(
+    tmp_path: Path,
+) -> None:
+    graph, graph_scope = _seed_pending_codegraph_receipt(tmp_path)
+    pending = graph.peek_affected_receipt(scope=graph_scope)
+    assert pending is not None
+    receipt_id = pending["receipt_id"]
+
+    port = NativeV2RuntimePort(tmp_path, state_provider=_ActiveManifest())
+    omitted = port.dispatch_mcp(
+        "memoryguard_context_bootstrap",
+        _request(tmp_path, task="Worker", max_items=0),
+        context=_transport_context(tmp_path),
+        generation=7,
+        state="V2_ACTIVE",
+    )
+    assert omitted["ok"] is True, omitted
+    assert omitted["data"]["status"] == "ok"
+    assert omitted["data"]["reference_only"] == []
+    assert graph.peek_affected_receipt(scope=graph_scope)["receipt_id"] == receipt_id
+
+    delivered = port.dispatch_mcp(
+        "memoryguard_context_bootstrap",
+        _request(tmp_path, task="Worker"),
+        context=_transport_context(tmp_path),
+        generation=7,
+        state="V2_ACTIVE",
+    )
+    assert delivered["ok"] is True, delivered
+    data = delivered["data"]
+    assert data["status"] == "ok"
+    assert data["codegraph_affected"]["receipt_id"] == receipt_id
+    assert data["reference_only"][0]["ref"].startswith("codegraph:affected:")
+    references = json.dumps(data["reference_only"], ensure_ascii=False)
+    assert "changed/affected IDs:" in references
+    expected_ids = pending["result_ids"] or pending["start_ids"]
+    assert expected_ids and str(expected_ids[0]) in references
+    assert graph.peek_affected_receipt(scope=graph_scope) is None
+
+
+class _ReadyManifest:
+    def current(self):
+        return {"state": "V2_READY", "generation": 7}
+
+
+def test_affected_receipt_stays_pending_in_shadow_state(tmp_path: Path) -> None:
+    graph, graph_scope = _seed_pending_codegraph_receipt(tmp_path)
+    port = NativeV2RuntimePort(tmp_path, state_provider=_ReadyManifest())
+
+    result = port.dispatch_mcp(
+        "memoryguard_context_bootstrap",
+        _request(tmp_path, task="Worker"),
+        context=_transport_context(tmp_path),
+        generation=7,
+        state="V2_READY",
+    )
+    assert result["ok"] is True, result
+    assert result["data"]["status"] == "shadow"
+    assert graph.peek_affected_receipt(scope=graph_scope) is not None
+
+
+def test_codegraph_reference_candidates_emit_one_receipt_across_nearest_scopes(
+    tmp_path: Path,
+) -> None:
+    graph, root_scope = _seed_pending_codegraph_receipt(tmp_path)
+    root_receipt = graph.peek_affected_receipt(scope=root_scope)
+    assert root_receipt is not None
+
+    child = tmp_path / "nested"
+    child_source = child / "src" / "Worker.py"
+    child_source.parent.mkdir(parents=True, exist_ok=True)
+    child_source.write_text("class Worker:\n    pass\n", encoding="utf-8")
+    child_scope = CodeGraphScope(
+        workspace_id=str(tmp_path.resolve()),
+        agent_instance_id="",
+        project_ref=_project(child),
+        provider="graphify",
+        share_group_id="group-a",
+        runtime_role="",
+    )
+    graph.upsert_source_file(
+        "src/Worker.py",
+        "child-before-refresh",
+        scope=child_scope,
+        symbols=[{
+            "id": "child-worker-symbol",
+            "name": "Worker",
+            "kind": "class",
+            "signature": "class Worker",
+            "provenance": "production",
+        }],
+    )
+    child_source.write_text(
+        "class Worker:\n    pass\n\nclass ChildChanged:\n    pass\n",
+        encoding="utf-8",
+    )
+    child_result = apply_incremental_refresh(
+        graph,
+        scope=child_scope,
+        source_root=child,
+        relative_paths=["src/Worker.py"],
+    )
+    assert child_result["status"] == "updated"
+    assert graph.peek_affected_receipt(scope=child_scope) is not None
+
+    from memoryguard.context_bootstrap import codegraph_reference_candidates
+
+    references = codegraph_reference_candidates(
+        tmp_path,
+        agent_instance_id="agent-a",
+        project_ref=_project(tmp_path),
+        share_group_id="group-a",
+        provider="codex",
+        runtime_role="root",
+        query="Worker",
+        limit=4,
+    )
+    affected = [
+        item for item in references
+        if str(item.get("ref") or "").startswith("codegraph:affected:")
+    ]
+    assert len(affected) == 1
+    assert affected[0]["ref"] == f"codegraph:affected:{root_receipt['receipt_id']}"
 
 
 def test_reference_only_renderer_and_codegraph_paths_are_normalized(tmp_path: Path) -> None:

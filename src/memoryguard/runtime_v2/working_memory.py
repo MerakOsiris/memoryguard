@@ -728,6 +728,7 @@ class RuntimeStore:
         importance: int,
         mutation: MutationContext,
         requested_by: str = "",
+        request_fingerprint: str = "",
         fail_at: str | None = None,
     ) -> TaskRun:
         self._require_mutation(mutation)
@@ -740,6 +741,13 @@ class RuntimeStore:
         safe_goal = _scalar_text(goal, label="goal", max_bytes=16 * 1024)
         importance_value = _scalar_int(importance, label="importance")
         requested_by_text = _scalar_text(requested_by, label="requested_by", default="")
+        fingerprint = _scalar_text(
+            request_fingerprint,
+            label="request_fingerprint",
+            default="",
+            max_bytes=256,
+            reject_content=False,
+        )
         fail_at_text = _scalar_text(fail_at, label="fail_at", default="", reject_content=False)
         if not run_id_text or not task_type_text:
             raise RuntimeV2Error("run_id and task_type are required")
@@ -748,6 +756,8 @@ class RuntimeStore:
             "importance": importance_value, "scope": mutation.scope.as_tuple(),
             "requested_by": requested_by_text,
         }
+        if fingerprint:
+            payload["request_fingerprint"] = fingerprint
         now = _now()
         with open_database(self.db_path) as conn:
             with transaction(conn):
@@ -767,9 +777,12 @@ class RuntimeStore:
                     (run_id_text, task_type_text, "queued", requested_by_text, "", "", "{}", now, safe_goal, importance_value, *mutation.scope.as_tuple()),
                 )
                 event_id = _stable_id("runtime-event", run_id_text, "", 0, mutation.idempotency_key)
+                event_payload = {"task_type": task_type_text, "goal": safe_goal}
+                if fingerprint:
+                    event_payload["request_fingerprint"] = fingerprint
                 conn.execute(
                     "INSERT INTO task_events(event_id,run_id,node_id,event_seq,event_type,payload_json,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (event_id, run_id_text, None, 0, "run_created", _json(self._event_payload({"task_type": task_type_text, "goal": safe_goal})), mutation.idempotency_key, now),
+                    (event_id, run_id_text, None, 0, "run_created", _json(self._event_payload(event_payload)), mutation.idempotency_key, now),
                 )
                 conn.execute(
                     "INSERT INTO task_heads(head_id,run_id,node_id,state,generation,last_event_seq,updated_at) VALUES(?,?,?,?,?,?,?)",
@@ -783,6 +796,33 @@ class RuntimeStore:
                 row = self._run_row(conn, run_id_text, mutation.scope)
                 assert row is not None
                 return self._run_from_row(row)
+
+    def request_fingerprint(self, run_id: str, scope: RuntimeScope) -> str:
+        """Return only persisted request hash for one scoped background run."""
+        if not self._scope_ok(scope) or not self.db_path.is_file():
+            return ""
+        run_id_text = _scalar_text(run_id, label="run_id")
+        with self.connection() as conn:
+            if self._run_row(conn, run_id_text, scope) is None:
+                return ""
+            row = conn.execute(
+                "SELECT payload_json FROM task_events WHERE run_id=? AND node_id IS NULL "
+                "AND event_type='run_created' ORDER BY event_seq ASC, event_id ASC LIMIT 1",
+                (run_id_text,),
+            ).fetchone()
+        if row is None:
+            return ""
+        try:
+            payload = json.loads(str(row[0] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        return _scalar_text(
+            payload.get("request_fingerprint") if isinstance(payload, Mapping) else "",
+            label="request_fingerprint",
+            default="",
+            max_bytes=256,
+            reject_content=False,
+        )
 
     def add_node(
         self,

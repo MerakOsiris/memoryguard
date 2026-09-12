@@ -37,6 +37,13 @@ MCP_TOOL_NAMES = frozenset({
     "memoryguard_codegraph_graph",
     "memoryguard_codegraph_query", "memoryguard_codegraph_path", "memoryguard_codegraph_explain",
     "memoryguard_codegraph_affected", "memoryguard_codegraph_update", "memoryguard_codegraph_status",
+    "memoryguard_capabilities", "memoryguard_invoke",
+    "memoryguard_knowledge_add", "memoryguard_knowledge_reingest",
+    "memoryguard_knowledge_rebuild_smart", "memoryguard_knowledge_remove",
+    "memoryguard_knowledge_restore", "memoryguard_knowledge_purge_deleted",
+    "memoryguard_knowledge_update_settings", "memoryguard_knowledge_candidate_review",
+    "memoryguard_task_status", "memoryguard_task_list", "memoryguard_task_cancel",
+    "memoryguard_codegraph_build_bound",
 })
 
 # Default MCP discovery is intentionally limited to the durable, day-to-day
@@ -53,7 +60,123 @@ MCP_DEFAULT_PUBLIC_TOOL_NAMES = (
     "memoryguard_memory_status",
     "memoryguard_audit",
     "memoryguard_explain",
+    "memoryguard_capabilities",
+    "memoryguard_invoke",
 )
+
+# Static reviewed snapshot. New GUI registrations default to unavailable to
+# MCP until they are deliberately added here.
+_MCP_BROKER_APPROVED_GUI_NAMES = frozenset("""
+accept_candidates add_source apply_build apply_enrichments apply_memoryguard_gc apply_plan
+archive_agent_dir archive_memory_group backfill_local_history bind_agent bind_agents_to_shared_group
+build_projection cancel_build_projection check_binding_drift clear_memory_group close_stale_conflict
+codegraph_status commit_selection commit_shared_memory_governance create_build_plan
+create_child_exception create_import create_rule_exception create_rule_from_text delete_archived_agent
+delete_history delete_memory delete_projection delete_quarantine detect_external_mcp discover_agents
+discover_local_history_sources dissolve_shared_group edit_memory ensure_personal_memory_group
+enter_multi_agent_mode exit_multi_agent_mode export_history export_memory_group extract_preview
+extract_preview_by_path generate_plan get_agent_data get_api_method_registry get_audit get_auto_actions
+get_build_progress get_codegraph_graph get_conflicts get_enrichment_status get_global_memory_status
+get_governance_scope get_governance_scope_state get_governance_snapshot get_host_enrichment_guide
+get_host_hook_status get_memory get_memory_ir get_memory_neuron_graph get_memory_source_map
+get_memory_status get_neuron_graph get_projection_source_map get_quarantine get_raw_memory
+get_recent_events get_request_status get_residual_cleanup get_rule_auto_scope_metrics
+get_rule_scope_options get_sandbox_status get_selection_tree get_shared_group_preview
+get_source_file_content get_storage_overview get_supersede_chain get_supersede_decisions
+get_usage_telemetry history_extract_preview history_read history_timeline import_external_mcp_entries
+import_native_memories_to_group install_shared_group_mcp_redirects knowledge_add knowledge_book
+knowledge_candidate_review knowledge_candidate_targets knowledge_candidates_list knowledge_deleted_list
+knowledge_job_status knowledge_list knowledge_purge_deleted knowledge_read knowledge_rebuild_smart
+knowledge_reingest knowledge_remove knowledge_restore knowledge_search knowledge_update_settings
+leave_shared_group_to_personal list_agent_candidates list_agents list_archived_agents list_bindings
+list_cleanup_history list_external_mcp_servers list_history list_history_sessions list_host_llm_agents
+list_memory list_memory_versions list_native_memory_releases list_pending_enrichments
+list_pending_requests list_publish_targets list_releases list_rule_cockpit list_rule_decisions
+list_rule_exceptions list_rule_match_receipts list_rules_habits list_share_groups list_sources
+lock_memory mark_agent_uninstalled neuron_decide plan_memoryguard_gc preview_effective_rules
+preview_external_mcp_import preview_import preview_source publish_reconstructed_memory
+read_rule_decision release_quarantine remove_source resolve_conflict restore_archived_agent
+restore_memory revoke_rule_exception rollback_memory rollback_native_memory_release rollback_release
+run_audit scan_sources search_history search_memory set_governance_scope set_host_hook_mode
+set_memory_injection_policy set_projection_source_enabled start_build_projection submit_rule_feedback
+sync_usage_telemetry unbind_agent undo_change undo_rule_decision uninstall_host_hook unlock_memory
+unmark_agent_uninstalled update_rule_audience verify_release
+""".split())
+_MCP_BROKER_UNAVAILABLE = {
+    "pick_path": "desktop_only",
+    "choose_publish_target_path": "desktop_only",
+    "open_agent_folder": "desktop_only",
+    "call_readonly": "bridge_protocol_only",
+    "request_mutation": "bridge_protocol_only",
+    "submit_request": "bridge_protocol_only",
+    "list_codegraph_projects": "desktop_admin_only",
+    "build_codegraph": "desktop_admin_only",
+}
+
+# Headless MCP entrypoints that reuse a narrow, bound GUI business operation.
+# This is deliberately a mapping rather than a generic GUI reflector: callers
+# may only reach entries reviewed for an MCP-issued native capability.
+MCP_GUI_BRIDGE_OPERATIONS: Mapping[str, str] = {
+    "memoryguard_knowledge_add": "knowledge_add",
+    "memoryguard_knowledge_reingest": "knowledge_reingest",
+    "memoryguard_knowledge_rebuild_smart": "knowledge_rebuild_smart",
+    "memoryguard_knowledge_remove": "knowledge_remove",
+    "memoryguard_knowledge_restore": "knowledge_restore",
+    "memoryguard_knowledge_purge_deleted": "knowledge_purge_deleted",
+    "memoryguard_knowledge_update_settings": "knowledge_update_settings",
+    "memoryguard_knowledge_candidate_review": "knowledge_candidate_review",
+    "memoryguard_task_status": "get_request_status",
+    "memoryguard_task_list": "list_pending_requests",
+    "memoryguard_task_cancel": "cancel_build_projection",
+}
+
+
+def resolve_mcp_broker_invocation(
+    payload: Mapping[str, object],
+    *,
+    tool_names: Iterable[str] = MCP_TOOL_NAMES,
+    mutation_names: Iterable[str] = (),
+    gui_names: Iterable[str] = (),
+    gui_mutation_names: Iterable[str] = (),
+) -> tuple[str, str, dict[str, object]]:
+    """Validate broker envelope and return one registered target call.
+
+    The broker is an explicit selector over known MCP operations.  It is never
+    a reflective path to native handlers or desktop methods.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("broker_arguments_required")
+    target = str(payload.get("operation") or "").strip()
+    if not target:
+        raise ValueError("broker_operation_required")
+    allowed = frozenset(str(name) for name in tool_names)
+    allowed_gui = frozenset(str(name) for name in gui_names)
+    if target == "memoryguard_invoke":
+        raise ValueError("broker_recursion_forbidden")
+    if target in allowed:
+        surface = "mcp"
+    elif target in allowed_gui:
+        surface = "gui"
+    else:
+        raise ValueError("broker_operation_unknown")
+    raw_arguments = payload.get("arguments", {})
+    if not isinstance(raw_arguments, Mapping):
+        raise ValueError("broker_arguments_invalid")
+    arguments = dict(raw_arguments)
+    if target in (frozenset(str(name) for name in mutation_names) | frozenset(str(name) for name in gui_mutation_names)):
+        if payload.get("confirmed") is not True:
+            raise ValueError("confirmation_required")
+        key = payload.get("idempotency_key")
+        if not isinstance(key, str) or not key.strip() or len(key.strip()) > 256:
+            raise ValueError("idempotency_key_required")
+        for field, value in (("confirmed", True), ("idempotency_key", key.strip())):
+            existing = arguments.get(field)
+            if existing not in (None, "", value):
+                raise ValueError("broker_argument_conflict")
+            if existing in (None, ""):
+                arguments[field] = value
+    return surface, target, arguments
 
 
 @dataclass(frozen=True)
@@ -70,6 +193,7 @@ class GuiOperationSpec:
     cancel_operation: str = ""
     idempotency: str = "none"
     confirmation: str = "none"
+    mcp_broker: str = "not_reviewed"
 
     def __post_init__(self) -> None:
         if not self.public_name or not self.canonical_name or not self.domain or not self.native_handler:
@@ -80,6 +204,8 @@ class GuiOperationSpec:
             raise ValueError("GUI operation execution must be sync or task")
         if self.execution == "task" and self.kind != "mutation" and self.canonical_name != "task_status":
             raise ValueError("only mutation operations may start tasks")
+        if self.mcp_broker not in {"headless_broker", "desktop_only", "desktop_admin_only", "bridge_protocol_only", "not_reviewed"}:
+            raise ValueError("invalid GUI MCP broker exposure")
 
     @property
     def mutation(self) -> bool:
@@ -97,6 +223,7 @@ class GuiOperationSpec:
             "cancel_operation": self.cancel_operation,
             "idempotency": self.idempotency,
             "confirmation": self.confirmation,
+            "mcp_broker": self.mcp_broker,
         }
 
 
@@ -115,6 +242,7 @@ def _add(
     cancel_operation: str = "",
     idempotency: str | None = None,
     confirmation: str | None = None,
+    mcp_broker: str | None = None,
 ) -> None:
     if public_name in _GUI_OPERATIONS:
         raise ValueError(f"duplicate GUI operation: {public_name}")
@@ -130,6 +258,10 @@ def _add(
         cancel_operation=cancel_operation,
         idempotency=idempotency or ("required" if mutation else "none"),
         confirmation=confirmation or ("required" if mutation else "none"),
+        mcp_broker=mcp_broker or (
+            "headless_broker" if public_name in _MCP_BROKER_APPROVED_GUI_NAMES
+            else _MCP_BROKER_UNAVAILABLE.get(public_name, "not_reviewed")
+        ),
     )
 
 
@@ -359,6 +491,35 @@ _add("list_pending_requests", "task_list", "runtime", "read", "gui_task_list")
 GUI_OPERATION_SPECS: Mapping[str, GuiOperationSpec] = dict(sorted(_GUI_OPERATIONS.items()))
 GUI_METHOD_NAMES = frozenset(GUI_OPERATION_SPECS)
 GUI_MUTATION_NAMES = frozenset(name for name, spec in GUI_OPERATION_SPECS.items() if spec.mutation)
+# Registry metadata is source-of-truth: an operation becomes brokerable only
+# when its constructed spec carries reviewed headless exposure above.
+MCP_BROKER_GUI_METHOD_NAMES = frozenset(
+    name for name, spec in GUI_OPERATION_SPECS.items()
+    if spec.mcp_broker == "headless_broker"
+)
+MCP_BROKER_GUI_EXCLUDED = frozenset(
+    name for name, spec in GUI_OPERATION_SPECS.items()
+    if spec.mcp_broker != "headless_broker"
+)
+MCP_BROKER_GUI_ADMIN_NAMES = frozenset({
+    "edit_memory", "lock_memory", "unlock_memory", "set_memory_injection_policy",
+    "restore_memory", "delete_memory", "rollback_memory", "add_source",
+    "remove_source", "apply_plan", "undo_change", "resolve_conflict",
+    "close_stale_conflict", "release_quarantine", "delete_quarantine",
+    "neuron_decide", "mark_agent_uninstalled", "unmark_agent_uninstalled",
+    "archive_agent_dir", "restore_archived_agent", "delete_archived_agent",
+    "bind_agent", "bind_agents_to_shared_group", "unbind_agent",
+    "ensure_personal_memory_group", "leave_shared_group_to_personal",
+    "dissolve_shared_group", "export_memory_group", "clear_memory_group",
+    "archive_memory_group", "install_shared_group_mcp_redirects",
+    "import_native_memories_to_group", "commit_shared_memory_governance",
+    "enter_multi_agent_mode", "exit_multi_agent_mode", "update_rule_audience",
+    "set_host_hook_mode", "uninstall_host_hook",
+})
+MCP_BROKER_GUI_HOST_BOUND_NAMES = frozenset({
+    "get_host_hook_status", "get_host_enrichment_guide", "list_host_llm_agents",
+    "sync_usage_telemetry",
+})
 SAFE_BRIDGE_METHOD_NAMES = frozenset({
     "call_readonly", "request_mutation", "get_api_method_registry", "get_sandbox_status", "pick_path",
 })
@@ -392,6 +553,11 @@ MCP_MUTATION_NAMES = frozenset({
     "memoryguard_binding_create", "memoryguard_external_mcp_import", "memoryguard_accept_candidates",
     "memoryguard_provider_install", "memoryguard_apply_enrichments", "memoryguard_history_delete",
     "memoryguard_codegraph_update",
+    "memoryguard_knowledge_add", "memoryguard_knowledge_reingest",
+    "memoryguard_knowledge_rebuild_smart", "memoryguard_knowledge_remove",
+    "memoryguard_knowledge_restore", "memoryguard_knowledge_purge_deleted",
+    "memoryguard_knowledge_update_settings", "memoryguard_knowledge_candidate_review",
+    "memoryguard_task_cancel", "memoryguard_codegraph_build_bound",
     *RULE_MUTATION_MCP_NAMES,
 })
 MUTATING_MCP_TOOL_NAMES = MCP_MUTATION_NAMES
@@ -407,7 +573,10 @@ GUI_MUTATION_METHOD_NAMES = GUI_MUTATION_NAMES
 
 __all__ = [
     "GuiOperationSpec", "GUI_OPERATION_SPECS", "get_gui_operation_spec", "gui_registry_payload",
-    "MCP_TOOL_NAMES", "MCP_DEFAULT_PUBLIC_TOOL_NAMES", "SAFE_BRIDGE_METHOD_NAMES",
+    "MCP_TOOL_NAMES", "MCP_DEFAULT_PUBLIC_TOOL_NAMES", "MCP_GUI_BRIDGE_OPERATIONS",
+    "MCP_BROKER_GUI_METHOD_NAMES", "MCP_BROKER_GUI_EXCLUDED",
+    "MCP_BROKER_GUI_ADMIN_NAMES", "MCP_BROKER_GUI_HOST_BOUND_NAMES",
+    "resolve_mcp_broker_invocation", "SAFE_BRIDGE_METHOD_NAMES",
     "GUI_METHOD_NAMES", "CLI_COMMAND_NAMES",
     "RULE_MUTATION_MCP_NAMES", "MCP_MUTATION_NAMES",
     "MUTATING_MCP_TOOL_NAMES", "RULE_MUTATION_GUI_NAMES",

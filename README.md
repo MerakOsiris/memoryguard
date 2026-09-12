@@ -342,7 +342,10 @@ source-body store.
 Open the desktop console and choose **Knowledge Library**. Remote embedding or
 model-backed indexing is opt-in and requires explicit authorization; local
 full-text retrieval remains available without sending source text to a remote
-provider.
+provider. Background imports, re-ingests, and smart rebuilds have durable task
+receipts: retrying the same request reuses its task, while reusing that key for
+a different request is rejected. A live task for a different request reports
+busy rather than claiming that work was accepted.
 
 ### CodeGraph refresh
 
@@ -352,7 +355,9 @@ refresh for that scope, subject to strict source-path and active-binding
 validation. Unchanged content hashes are a no-op; deleted files are retired;
 the next context receives one bounded `affected` receipt. MemoryGuard does not
 run a daemon or watcher for this path and does not infer paths from shell or
-free-form text.
+free-form text. A projectless MCP caller first builds an already-bound directory
+source, then passes its `codegraph_source_id` to select that exact scope for
+query, status, update, and graph reads.
 
 ### Desktop console surfaces
 
@@ -600,7 +605,7 @@ reference.
 ## MCP API
 
 The default MCP discovery surface is intentionally compact. New MCP clients
-receive these nine day-to-day tools through `tools/list`:
+receive these eleven day-to-day tools through `tools/list`:
 
 | Tool | Purpose |
 |---|---|
@@ -608,11 +613,13 @@ receive these nine day-to-day tools through `tools/list`:
 | `memoryguard_memory_search` | Search governed memories by query, lifecycle status, and bounded limit. `kind` is not an MCP search filter; semantic duplicate/conflict checks are separate advanced governance. |
 | `memoryguard_memory_read` | Read one governed memory |
 | `memoryguard_memory_write` | Write and organize a governed memory |
-| `memoryguard_memory_update` | Update the body, kind, recall policy, or priority of one known memory. It does not change lifecycle status or restore deleted records; restoration is a GUI governance action. |
+| `memoryguard_memory_update` | Update the body, kind, recall policy, or priority of one known memory. It does not change lifecycle status. |
 | `memoryguard_memory_delete` | Soft-delete a governed memory |
 | `memoryguard_memory_status` | Inspect shared-memory status |
 | `memoryguard_audit` | Run a read-only local governance audit |
 | `memoryguard_explain` | Explain one audit finding and its evidence |
+| `memoryguard_capabilities` | Discover registered MCP operations and reviewed headless GUI operations with bounded pagination and optional on-demand JSON Schema |
+| `memoryguard_invoke` | Invoke one discovered MCP or reviewed headless GUI operation; mutating targets require confirmation and an idempotency key |
 
 Advanced governance remains available through the GUI and CLI: rule lifecycle,
 bindings and shared groups, source scanning, CodeGraph, knowledge and history
@@ -621,6 +628,29 @@ Existing advanced MCP names remain callable for compatibility when an installed
 client invokes an exact name, but they are not returned by the default
 `tools/list`. This reduces discovery/schema overhead without removing those
 governance capabilities.
+
+`memoryguard_capabilities` is the discovery path for the broader compatibility
+catalog. It supports exact operation lookup, English or Chinese query text,
+domain filtering, and offset pagination; schemas are returned only when
+`include_schema=true` is requested for the selected page. The catalog exposes
+162 reviewed headless GUI business operations through `memoryguard_invoke`.
+Eight GUI operations remain explicitly restricted by their existing authority:
+desktop-only path/folder actions, desktop-admin CodeGraph selection/build, and
+SafeBridge protocol actions.
+
+Example discovery and invocation using the published schemas:
+
+```json
+{"operation":"memoryguard_task_list","include_schema":true,"limit":1}
+```
+
+```json
+{"operation":"memoryguard_task_list","arguments":{"limit":20}}
+```
+
+For a mutating target, the invoke envelope must also carry
+`"confirmed":true` and a non-empty `"idempotency_key"`; the broker forwards
+those proofs to the target's existing permission and scope checks.
 
 The underlying compatibility catalog also covers:
 
@@ -635,8 +665,9 @@ The underlying compatibility catalog also covers:
   extraction preview;
 - provider installation and host-agent enrichment.
 
-Use MCP `tools/list` as the source of truth for the exact tool set supported by
-the installed version.
+Use MCP `tools/list` for the compact default discovery set. Use
+`memoryguard_capabilities` for the registered compatibility catalog and its
+reviewed operation metadata.
 
 ## Project links
 

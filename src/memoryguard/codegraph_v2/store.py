@@ -1774,10 +1774,54 @@ class CodeGraphStore:
         )
         return payload
 
+    def _affected_receipt_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        scope_id: str,
+        consumed: bool,
+    ) -> dict[str, Any]:
+        return {
+            "receipt_id": str(row["receipt_id"]),
+            "scope_id": scope_id,
+            "start_ids": json.loads(str(row["start_ids_json"] or "[]")),
+            "result_ids": json.loads(str(row["result_json"] or "[]")),
+            "depth": int(row["depth"]),
+            "limit": int(row["result_limit"]),
+            "provenance": str(row["provenance_filter"]),
+            "digest": str(row["digest"]),
+            "consumed": bool(consumed),
+        }
+
+    def peek_affected_receipt(
+        self,
+        *,
+        scope: CodeGraphScope | Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Read one pending affected receipt without changing its state."""
+        checked_scope = self._scope(scope)
+        scope_id = self._scope_id(checked_scope)
+        with self.connection() as conn:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='affected_receipts' LIMIT 1",
+            ).fetchone()
+            if table is None:
+                return None
+            row = conn.execute(
+                "SELECT receipt_id,start_ids_json,result_json,digest,depth,result_limit,provenance_filter "
+                "FROM affected_receipts WHERE scope_id=? AND consumed=0 "
+                "ORDER BY created_at,receipt_id LIMIT 1",
+                (scope_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._affected_receipt_row(row, scope_id=scope_id, consumed=False)
+
     def consume_affected_receipt(
         self,
         *,
         scope: CodeGraphScope | Mapping[str, Any] | None = None,
+        receipt_id: str = "",
     ) -> dict[str, Any] | None:
         checked_scope = self._scope(scope, write=True)
         scope_id = self._scope_id(checked_scope)
@@ -1785,10 +1829,17 @@ class CodeGraphStore:
         with open_database(self.db_path) as conn:
             with transaction(conn):
                 self._ensure_refresh_schema_conn(conn)
+                clauses = ["scope_id=?", "consumed=0"]
+                params: list[Any] = [scope_id]
+                expected = str(receipt_id or "").strip()
+                if expected:
+                    clauses.append("receipt_id=?")
+                    params.append(expected)
                 row = conn.execute(
                     "SELECT receipt_id,start_ids_json,result_json,digest,depth,result_limit,provenance_filter "
-                    "FROM affected_receipts WHERE scope_id=? AND consumed=0 ORDER BY created_at,receipt_id LIMIT 1",
-                    (scope_id,),
+                    "FROM affected_receipts WHERE " + " AND ".join(clauses) +
+                    " ORDER BY created_at,receipt_id LIMIT 1",
+                    params,
                 ).fetchone()
                 if row is None:
                     return None
@@ -1799,17 +1850,7 @@ class CodeGraphStore:
                 changed = conn.execute("SELECT changes()").fetchone()
                 if changed is None or int(changed[0]) != 1:
                     return None
-        return {
-            "receipt_id": str(row["receipt_id"]),
-            "scope_id": scope_id,
-            "start_ids": json.loads(str(row["start_ids_json"] or "[]")),
-            "result_ids": json.loads(str(row["result_json"] or "[]")),
-            "depth": int(row["depth"]),
-            "limit": int(row["result_limit"]),
-            "provenance": str(row["provenance_filter"]),
-            "digest": str(row["digest"]),
-            "consumed": True,
-        }
+        return self._affected_receipt_row(row, scope_id=scope_id, consumed=True)
 
     def related_source_paths(
         self,
