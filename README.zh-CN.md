@@ -36,27 +36,26 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
-## v0.7.11 更新
+## v0.7.12 更新
 
-v0.7.11 是公开文档与发现性一致性修订；本文概述的运行时行为主体来自 v0.7.9：
+v0.7.12 改进 MCP 发现面、有界读取和本地用量计量，同时保留现有治理动作与
+MCP name：`io.github.irisxc4/memoryguard`。
 
-- **Canonical 记忆与规则治理：** 相关规则、习惯和记忆通过统一 canonical 读写路径合并，
-  同时保留证据、来源链接、神经图分支、覆盖历史、冲突复核和 settlement 审计，且可逆。
-- **可读的多 Agent 治理：** 已验证的程序身份、可读名称、安全的程序族图标、共享组作用域、
-  风险解释、失效冲突收口、七个治理页及独立 Token 用量与节省入口统一呈现，日常治理不再依赖技术 ID。
-- **本地用量与节省视图：** Token 页显示本地 MCP 转换事件，以及 7 天/30 天窗口的原始基线
-  与实际注入量估算。只有宿主真实上报 token 时才记录测量（当前支持 Codex、Grok）；Claude、
-  Cursor、Trae 明确显示为不支持。不会保存对话正文、账号、路径或实例标识。
-- **Codex 生命周期与运行时对齐：** 只有终止 thread 证据证明属于 Codex 的进程 cohort 才可回收，
-  普通对话轮次仍可恢复。已安装版修复会让 MCP 与生命周期 Hook 使用当前解释器，同时保留
-  Agent/共享组身份和 fail-closed 边界。
-- **证据与曝光准备：** `scripts/benchmark_usage_telemetry.py` 提供 7 天/30 天本地测量，
-  明确区分宿主上报、派生总量、确定性估算和无样本状态。发布通过 GitHub OIDC
-  到 [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)、
-  [PyPI](https://pypi.org/project/agent-memguard/) 和官方 MCP Registry；请以
-  这些实时记录核验当前包与注册表状态。这里不宣称 Glama 评分或其他第三方目录已收录。
+- **11 个默认工具和完整目录：** 新 MCP 客户端通过 `tools/list` 获取 11 个日常
+  工具，包括能力发现和治理调用。`memoryguard_capabilities` 提供分页的 MCP
+  操作与经审查的 headless GUI 操作元数据；高级 MCP 名称仍可按精确名称兼容调用。
+- **有界读取响应：** 可重放的成功读取以完整 MCP envelope 的 24,000 UTF-8
+  字节为上限；合格的超大读取才会返回短期进程内存的 `response_ref`，不截断原始数据；
+  无法安全重放或超过快照上限的读取返回有界的缩小查询提示。私有引用每页都在当前可信
+  session 和 binding 下复核；写入和
+  `context_bootstrap` 保留完整 receipt/强制规则合约，不能请求响应分页。
+- **缓存感知用量：** 分开记录宿主上报的 cache-read 和 cache-write input，并给出
+  `complete`、`partial`、`unavailable` 覆盖状态；实测 0 保持为 0，缺失数据保持未知。
+  确定性单位估算明确标为估算，不声称实测 token 降幅。
+- **治理调用：** 变更类 broker 目标仍要求确认和非空 idempotency key，并由目标继续执行既有
+  权限、作用域和 readiness 检查。
 
-详见 [v0.7.11 发布说明](docs/releases/v0.7.11.md) 与
+详见 [v0.7.12 发布说明](docs/releases/v0.7.12.md) 与
 [更新日志](CHANGELOG.md)。
 
 更早版本的细节请见[更新日志](CHANGELOG.md)和
@@ -73,6 +72,7 @@ python scripts/benchmark_usage_telemetry.py --workspace . --window-days 7 --sync
 请阅读[用量基准说明](docs/benchmarks/README.md)了解宿主上报、派生、估算和不支持状态，
 并按[演示录制清单](docs/benchmarks/demo-script.md)制作脱敏演示。仓库中的神经图是合成插图，
 不是实际产品录屏，也不能作为用量或节省证据。
+
 
 ## v0.6.0 重大 V2 重构
 
@@ -406,7 +406,7 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 
 ## MCP API
 
-默认 MCP 发现面保持精简。新 MCP 客户端通过 `tools/list` 获得以下 9 个日常工具：
+默认 MCP 发现面保持精简。新 MCP 客户端通过 `tools/list` 获得以下 11 个日常工具：
 
 | 工具 | 用途 |
 |---|---|
@@ -419,11 +419,38 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 | `memoryguard_memory_status` | 查看共享记忆状态 |
 | `memoryguard_audit` | 执行只读本地治理审计 |
 | `memoryguard_explain` | 解释审计发现及其证据 |
+| `memoryguard_capabilities` | 发现已注册 MCP 操作和经审查的 headless GUI 操作，支持分页和按需 JSON Schema |
+| `memoryguard_invoke` | 调用已发现的 MCP 或经审查的 headless GUI 操作；变更目标要求确认和 idempotency key |
 
 高级治理能力仍保留在 GUI 和 CLI：规则生命周期、绑定与共享组、来源扫描、
 CodeGraph、知识库与历史复核、Provider 控制、外部 MCP 导入及维护操作。
 已有高级 MCP 名称在已安装客户端按精确名称调用时仍保持兼容，但不会出现在默认
 `tools/list` 中。这样减少发现和 schema 的上下文负担，不会删除这些治理能力。
+
+`memoryguard_capabilities` 提供完整注册的 MCP 操作和 headless GUI 操作元数据，
+支持精确名称、query、domain 过滤和 offset 分页；只有 `include_schema=true` 时才在
+选定页返回 JSON Schema。`memoryguard_invoke` 调用已注册目标；变更目标仍要求
+`confirmed=true` 和非空 `idempotency_key`，这些证明会传递给目标的权限、作用域和 readiness 检查。
+
+### 有界读取响应
+
+MemoryGuard 默认压缩 JSON 文本。可重放的成功读取以完整 MCP envelope 的 24,000
+UTF-8 字节为上限。小响应保持原有形状；符合回取条件的超大成功读取返回带 `response_ref` 的有界
+receipt，不会静默截断。通过已注册的 broker `memoryguard_response_read` 读取页面，
+它不属于默认 `tools/list`，应通过 `memoryguard_invoke` 调用。
+
+页面是带 `next_offset` 的 UTF-8 JSON 片段；`limit` 为 4–4096 字节，offset 必须位于
+UTF-8 字符边界。单个 JSON 文本 payload 可以用顶层字段名或对象型 JSON Pointer（例如
+`/data/memory_id`）选择业务字段；多 content 和非 JSON 结果拒绝字段选择，只能读取完整 envelope 页面。
+
+私有引用只存在于 MCP 进程内，最长 5 分钟，最多 16 个快照，每个最多 512,000 字节；
+它绑定准确的可信 session、principal、scope 和 active binding revision。每一页都会在当前
+授权下重新执行原始读取并比较 digest。拒绝、结果改变、binding/session 改变或过期会返回
+稳定错误，例如 `response_ref_access_denied`、`response_ref_expired` 或
+`response_ref_result_changed`；旧缓存不能绕过当前读取。公共能力元数据继续使用现有 offset 分页。
+写入动作和 `context_bootstrap` 保留完整 receipt/强制规则合约，不能请求响应分页，因此分页不会
+再次执行 mutation。若超大读取无法安全建立引用，则返回 `delivery.status="unavailable"` 和
+`action="narrow_query"`，不会承诺可取回完整结果。
 
 底层兼容调用目录还覆盖：
 
@@ -443,6 +470,7 @@ CodeGraph、知识库与历史复核、Provider 控制、外部 MCP 导入及维
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.12 发布说明](docs/releases/v0.7.12.md)
 - [v0.7.11 发布说明](docs/releases/v0.7.11.md)
 - [v0.7.9 发布记录](docs/releases/v0.7.9.md)
 - [v0.7.8 发布记录](docs/releases/v0.7.8.md)

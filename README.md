@@ -39,37 +39,35 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.7.11
+## What's New in v0.7.12
 
-v0.7.11 is a public documentation and discovery consistency release. Runtime
-behavior summarized here originates in v0.7.9:
+v0.7.12 improves MCP discovery, bounded read delivery, and local usage
+telemetry while preserving the existing governed action checks and MCP name:
 
-- **Canonical memory and rule governance:** related rules, habits, and memories
-  converge through one canonical read/write path while evidence, source links,
-  graph branches, supersede history, conflict review, and settlement remain
-  auditable and reversible.
-- **Readable multi-agent governance:** verified program identities, readable
-  labels, safe family icons, shared-group scope, risk explanations, stale-conflict
-  closure, seven governance pages, and a separate Token usage-and-savings entry
-  keep daily governance understandable.
-- **Local usage and savings view:** the Token page shows local MCP conversion
-  events and seven-/thirty-day estimated baseline-versus-delivered units.
-  Provider token measurements are used only when reported (currently Codex and
-  Grok); Claude, Cursor, and Trae remain explicitly unsupported. No conversation
-  body, account, path, or instance identifier is stored.
-- **Codex lifecycle and runtime alignment:** terminal-thread evidence gates
-  reclamation of Codex-owned leaked cohorts; ordinary turns remain resumable.
-  Installed repair aligns MCP and lifecycle Hooks to the current interpreter
-  while preserving Agent/shared-group identity and fail-closed boundaries.
-- **Evidence and discovery:** `scripts/benchmark_usage_telemetry.py` documents
-  reproducible seven-/thirty-day local measurements with explicit coverage and
-  no-sample semantics. Releases are published through GitHub OIDC to
-  [GitHub Releases](https://github.com/irisxc4/memoryguard/releases),
-  [PyPI](https://pypi.org/project/agent-memguard/), and the official MCP
-  Registry. Verify current package and registry status through those live
-  records. No Glama score or third-party directory listing is implied.
+- **Compact discovery with a complete catalog:** New MCP clients receive 11
+  day-to-day tools from `tools/list`, including capability discovery and the
+  governed invocation broker. `memoryguard_capabilities` provides paginated
+  metadata for registered MCP operations and reviewed headless GUI operations;
+  exact advanced MCP names remain callable for compatibility.
+- **Bounded read delivery:** Replayable successful reads are capped at 24,000
+  UTF-8 bytes across the complete MCP envelope. Eligible oversized reads return
+  a short-lived process-local reference rather than truncating data; reads that
+  cannot be safely replayed or exceed the snapshot limit return a bounded
+  narrowing hint. Pages support UTF-8 offsets and field selection. Private
+  references revalidate the original read under the current trusted session and
+  binding before each page. Writes and context bootstrap keep their complete
+  receipt/mandatory-rule contracts and cannot request response paging.
+- **Cache-aware local telemetry:** Provider-reported cache-read and cache-write
+  input counts are kept separately with complete/partial/unavailable coverage.
+  A measured zero remains zero; missing provider data remains unknown. The
+  deterministic unit estimate is labeled as an estimate and does not claim a
+  measured token reduction.
+- **Governed invocation:** Mutating broker targets still require confirmation
+  and a non-empty idempotency key, which are forwarded to the target's existing
+  permission, scope, and readiness checks. The MCP name remains
+  `io.github.irisxc4/memoryguard`.
 
-See the [v0.7.11 release note](docs/releases/v0.7.11.md) and
+See the [v0.7.12 release note](docs/releases/v0.7.12.md) and
 [release history](CHANGELOG.md).
 
 Earlier release details are kept in the [Changelog](CHANGELOG.md) and
@@ -725,6 +723,7 @@ reviewed operation metadata.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.12 release note](docs/releases/v0.7.12.md)
 - [v0.7.11 release note](docs/releases/v0.7.11.md)
 - [v0.7.9 release record](docs/releases/v0.7.9.md)
 - [v0.7.8 release record](docs/releases/v0.7.8.md)

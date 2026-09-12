@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.7.12] - 2026-09-12
+
+### Added
+
+- The default MCP discovery surface now exposes 11 day-to-day tools through
+  `tools/list`, while keeping the registered MCP operation catalog and
+  reviewed headless GUI metadata available through `memoryguard_capabilities`.
+- Added bounded response delivery for eligible oversized, replayable reads. The
+  broker returns a short-lived process-local `response_ref` with UTF-8 paging
+  and business-field selection instead of silently truncating a result.
+- Added separate measured cache-read and cache-write input totals and explicit
+  `complete`/`partial`/`unavailable` cache coverage states to local telemetry.
+
+### Changed
+
+- Successful replayable reads are bounded at 24,000 UTF-8 bytes across the full
+  MCP envelope. References live for at most five minutes, are capped at 16
+  in-memory snapshots of at most 512,000 bytes each, and are revalidated under
+  the current trusted session, scope, and binding before every page.
+- `memoryguard_invoke` preserves the existing mutation contract: mutating
+  targets require `confirmed=true` and a non-empty `idempotency_key`, which are
+  forwarded to the target's existing permission, scope, and readiness checks.
+- Writes and `memoryguard_context_bootstrap` keep their complete receipt and
+  mandatory-rule contracts and cannot request response pagination; paging never
+  reruns a mutation. When a read cannot safely create a reference, the bounded
+  response reports `delivery.status="unavailable"` with
+  `action="narrow_query"`.
+- Provider-reported zero remains zero, while missing cache or token data remains
+  unknown. Deterministic MemoryGuard units remain explicitly estimated and are
+  not presented as measured provider-token savings.
+
+### Validation boundary
+
+- The implementation tip passed the official four-job CI matrix: Ubuntu full
+  pytest and acceptance on Python 3.10 and 3.12, plus Windows runtime lease
+  acceptance on Python 3.10 and 3.12.
+- Local targeted acceptance recorded 85 passed for runtime lease plus knowledge
+  library and knowledge acceptance checks. The rule-merge acceptance reported
+  `ACCEPTED`/`passed: true`; lifecycle acceptance reported
+  `passed: true`, `total: 200`, and `categories_passed: true`, with empty
+  production defects and errors.
+- These records make no claim of an empirically measured token-reduction rate.
+
 ## [0.7.11] - 2026-09-04
 
 ### Changed
