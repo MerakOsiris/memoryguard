@@ -40,9 +40,16 @@ def _codex_token_row(timestamp: str, input_tokens: int, output_tokens: int) -> d
 def test_sync_is_idempotent_and_keeps_measured_tokens_separate(tmp_path: Path) -> None:
     codex_home = tmp_path / "codex"
     grok_home = tmp_path / "grok"
+    codex_row = _codex_token_row("2026-08-28T01:02:03Z", 100, 20)
+    codex_usage = codex_row["payload"]["info"]["last_token_usage"]
+    codex_usage.pop("cached_input_tokens")
+    codex_usage["input_tokens_details"] = {
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+    }
     _write_jsonl(
         codex_home / "sessions/2026/08/28/rollout-abc123.jsonl",
-        [_codex_token_row("2026-08-28T01:02:03Z", 100, 20)],
+        [codex_row],
     )
     _write_jsonl(
         grok_home / "logs/unified.jsonl",
@@ -74,6 +81,8 @@ def test_sync_is_idempotent_and_keeps_measured_tokens_separate(tmp_path: Path) -
     assert summary["schema_version"] == 2
     assert summary["window_days"] == 7
     assert summary["summary"]["measured_input"] == 150
+    assert summary["summary"]["measured_cached_input"] == 5
+    assert summary["summary"]["measured_cache_write_input"] == 0
     assert summary["summary"]["measured_output"] == 30
     # Grok reports prompt/completion fields, not a provider total.  Keep the
     # verified fields separate rather than presenting their sum as one.
@@ -84,6 +93,11 @@ def test_sync_is_idempotent_and_keeps_measured_tokens_separate(tmp_path: Path) -
     assert summary["summary"]["measured_total_coverage"] == {
         "provider_reported": "partial",
         "input_output_derived": "complete",
+        "measured_event_count": 2,
+    }
+    assert summary["summary"]["measured_cache_coverage"] == {
+        "cache_read": "complete",
+        "cache_write": "partial",
         "measured_event_count": 2,
     }
     assert summary["summary"]["measured_event_count"] == 2
@@ -124,6 +138,81 @@ def test_conversion_event_uses_deterministic_basis_for_ratio(tmp_path: Path) -> 
     assert summary["summary"]["estimated_ratio"] == 0.6
     assert summary["summary"]["savings_ratio"] == 0.6
     assert summary["summary"]["measured_total"] is None
+
+
+def test_old_usage_schema_migrates_cache_write_and_sync_remains_idempotent(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    database = workspace / ".memoryguard" / "usage_telemetry.sqlite"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        # Pre-cache-write v2 schema: migration must add only new nullable field.
+        connection.execute(
+            """
+            CREATE TABLE usage_events (
+                event_key TEXT PRIMARY KEY,
+                event_kind TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                program TEXT NOT NULL,
+                agent_stable_key TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                source_generation INTEGER NOT NULL DEFAULT 0,
+                source_offset INTEGER,
+                source_ordinal INTEGER,
+                observed_at_utc TEXT NOT NULL,
+                measurement_basis TEXT NOT NULL,
+                input_tokens INTEGER,
+                cached_input_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_output_tokens INTEGER,
+                total_tokens INTEGER,
+                baseline_units INTEGER,
+                delivered_units INTEGER,
+                conversion_count INTEGER NOT NULL DEFAULT 0,
+                share_group_hash TEXT,
+                project_ref_hash TEXT,
+                scope_kind TEXT NOT NULL DEFAULT 'host'
+            )
+            """
+        )
+        connection.commit()
+
+    codex_home = tmp_path / "codex"
+    row = _codex_token_row("2026-08-28T01:00:00Z", 12, 3)
+    row["payload"]["info"]["last_token_usage"]["cache_write_tokens"] = 7
+    _write_jsonl(
+        codex_home / "sessions/2026/08/28/rollout-cache-write.jsonl",
+        [row],
+    )
+
+    first = sync_usage_telemetry(
+        workspace,
+        codex_home=codex_home,
+        grok_home=tmp_path / "grok",
+        now_utc="2026-08-28T02:00:00Z",
+    )
+    second = sync_usage_telemetry(
+        workspace,
+        codex_home=codex_home,
+        grok_home=tmp_path / "grok",
+        now_utc="2026-08-28T02:01:00Z",
+    )
+
+    assert first["inserted"] == 1
+    assert second["inserted"] == 0
+    with sqlite3.connect(database) as connection:
+        columns = {item[1] for item in connection.execute("PRAGMA table_info(usage_events)")}
+        stored = connection.execute(
+            "SELECT cache_write_input_tokens FROM usage_events"
+        ).fetchone()[0]
+    assert "cache_write_input_tokens" in columns
+    assert stored == 7
+
+    summary = get_usage_summary(workspace, window_days=7, now_utc="2026-08-28T02:02:00Z")
+    assert summary["summary"]["measured_cache_write_input"] == 7
+    assert summary["summary"]["measured_event_count"] == 1
 
 
 def test_truncated_source_rotates_generation_without_duplicate(tmp_path: Path) -> None:

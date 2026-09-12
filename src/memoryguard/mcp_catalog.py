@@ -1407,9 +1407,52 @@ _TASK_MCP_OPERATIONS = frozenset({
     "memoryguard_knowledge_rebuild_smart", "memoryguard_codegraph_build_bound",
 })
 
+# This is deliberately a broker extension, not a twelfth default tool or a
+# native handler.  It can only page a response reference issued by this MCP
+# process; the server validates its original read again before every page.
+_RESPONSE_READ_OPERATION = {
+    "name": "memoryguard_response_read",
+    "surface": "mcp",
+    "domain": "broker",
+    "availability": "registered",
+    "broker_invocable": True,
+    "kind": "read",
+    "mutation": False,
+    "parameters": ["response_ref", "fields", "offset", "limit"],
+    "required": ["response_ref"],
+    "confirmation": "none",
+    "idempotency": "none",
+    "direct_confirmation": "not_callable_directly",
+    "direct_idempotency": "not_callable_directly",
+    "execution": "sync",
+    "task_receipt": "",
+    "cancel_operation": "",
+    "description": (
+        "Read one UTF-8 page from a bounded response reference. Private references "
+        "revalidate the original read under the current trusted binding and session; "
+        "changed, deleted, sensitive, revoked, or expired results are refused."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "response_ref": {"type": "string", "description": "opaque response reference id"},
+            "fields": {
+                "type": "array", "items": {"type": "string"},
+                "description": "optional business field names or object-only JSON Pointers for one JSON payload",
+            },
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+            "limit": {"type": "integer", "minimum": 4, "maximum": 4096, "default": 3000},
+        },
+        "required": ["response_ref"],
+        "additionalProperties": False,
+    },
+}
+
 
 def _capability_domain(name: str) -> str:
     normalized = name.removeprefix("memoryguard_")
+    if normalized == "response_read":
+        return "broker"
     for domain in ("knowledge", "codegraph", "memory", "rule", "history", "binding", "projection"):
         if normalized.startswith(domain + "_") or normalized == domain:
             return domain
@@ -1507,6 +1550,10 @@ def mcp_capability_catalog(args: Mapping[str, Any] | None = None) -> dict[str, A
     entries: list[dict[str, Any]] = [
         _catalog_mcp_item(name, include_schema=include_schema) for name in sorted(TOOL_DEFINITIONS)
     ]
+    response_read = deepcopy(_RESPONSE_READ_OPERATION)
+    if not include_schema:
+        response_read.pop("input_schema", None)
+    entries.append(response_read)
     entries.extend(
         _catalog_gui_item(name, operation)
         for name, operation in sorted(GUI_OPERATION_SPECS.items())

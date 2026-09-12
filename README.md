@@ -77,6 +77,13 @@ Earlier release details are kept in the [Changelog](CHANGELOG.md) and
 
 ### Token evidence and demo
 
+Usage events distinguish `measured_cached_input` from
+`measured_cache_write_input`. `measured_cache_coverage.cache_read` and
+`cache_write` report `complete`, `partial`, or `unavailable`; measured zero
+remains `0`, while missing provider data remains `None`/`unavailable`.
+Character-based estimates remain explicitly labelled
+`estimated mg_deterministic_unit`, never provider tokens.
+
 Run the benchmark only against an authorized local workspace:
 
 ```powershell
@@ -637,6 +644,50 @@ domain filtering, and offset pagination; schemas are returned only when
 Eight GUI operations remain explicitly restricted by their existing authority:
 desktop-only path/folder actions, desktop-admin CodeGraph selection/build, and
 SafeBridge protocol actions.
+
+### Bounded read responses
+
+MemoryGuard minifies JSON text by default. A replayable read response is capped
+at **24,000 UTF-8 bytes across the complete MCP envelope**, including every
+`content` block and existing `structuredContent`. Small responses keep their
+existing shape. An oversized read returns a compact receipt with `response_ref`
+and required identifiers; it does not silently truncate the original result.
+
+Fetch a page through the existing broker, after discovering
+`memoryguard_response_read` with `memoryguard_capabilities`:
+
+```json
+{
+  "operation": "memoryguard_response_read",
+  "arguments": {
+    "response_ref": "opaque-id",
+    "fields": ["/data/memory_id"],
+    "offset": 0,
+    "limit": 3000
+  }
+}
+```
+
+Pages are UTF-8 JSON fragments with `next_offset`; concatenate them in order.
+`limit` is 4–4096 bytes and offsets must be UTF-8 character boundaries. On a
+single JSON text payload, `fields` selects business fields: use a top-level
+name or an object-only JSON Pointer such as `/data/memory_id`. Multi-content
+and non-JSON results reject field selection and remain available only as
+whole-envelope pages.
+Private references live only in the MCP process for at most five minutes: at
+most 16 snapshots, each at most 512,000 bytes. They are bound to the exact
+trusted session, principal, scope, and active binding revision. Each page
+reruns the original **read** under current authorization and compares its
+digest. A denial, changed output, binding/session change, or expired reference
+returns a stable refusal such as `response_ref_access_denied`,
+`response_ref_expired`, or `response_ref_result_changed`; cached old content
+is never used to bypass the current read. Public capability metadata uses its
+existing offset pagination. Writes and context bootstrap keep their existing
+complete receipt/mandatory-rule contracts and cannot request response
+pagination, so a page read never reruns a mutation. If an oversized read cannot
+safely create a reference, its bounded receipt reports
+`delivery.status="unavailable"` and `action="narrow_query"` rather than
+promising the whole result can be retrieved.
 
 Example discovery and invocation using the published schemas:
 

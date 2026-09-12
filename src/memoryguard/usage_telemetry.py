@@ -287,6 +287,7 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             measurement_basis TEXT NOT NULL,
             input_tokens INTEGER,
             cached_input_tokens INTEGER,
+            cache_write_input_tokens INTEGER,
             output_tokens INTEGER,
             reasoning_output_tokens INTEGER,
             total_tokens INTEGER,
@@ -330,6 +331,7 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         for row in connection.execute("PRAGMA table_info(usage_events)")
     }
     for name, declaration in (
+        ("cache_write_input_tokens", "INTEGER"),
         ("share_group_hash", "TEXT"),
         ("project_ref_hash", "TEXT"),
         ("scope_kind", "TEXT NOT NULL DEFAULT 'host'"),
@@ -508,7 +510,8 @@ def _insert_event(connection: sqlite3.Connection, event: Mapping[str, Any]) -> b
         "event_key", "event_kind", "provider", "program", "agent_stable_key",
         "source_kind", "source_hash", "source_generation", "source_offset",
         "source_ordinal", "observed_at_utc", "measurement_basis", "input_tokens",
-        "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
+        "cached_input_tokens", "cache_write_input_tokens", "output_tokens",
+        "reasoning_output_tokens",
         "total_tokens", "baseline_units", "delivered_units", "conversion_count",
         "share_group_hash", "project_ref_hash", "scope_kind",
     )
@@ -534,9 +537,30 @@ def _event_from_usage(
     usage: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     input_tokens = _safe_int(usage.get("input_tokens"))
-    cached_input_tokens = _safe_int(
-        usage.get("cached_input_tokens", usage.get("cache_read_input_tokens"))
-    )
+
+    def _usage_int(*keys: str) -> int | None:
+        for key in keys:
+            if key in usage:
+                value = _safe_int(usage.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    details = usage.get("input_tokens_details")
+    details = details if isinstance(details, Mapping) else {}
+    cached_input_tokens = _usage_int("cached_input_tokens", "cache_read_input_tokens")
+    if cached_input_tokens is None:
+        cached_input_tokens = next(
+            (
+                _safe_int(details.get(key))
+                for key in ("cached_tokens", "cache_read_tokens")
+                if key in details and _safe_int(details.get(key)) is not None
+            ),
+            None,
+        )
+    cache_write_input_tokens = _usage_int("cache_write_input_tokens", "cache_write_tokens")
+    if cache_write_input_tokens is None:
+        cache_write_input_tokens = _safe_int(details.get("cache_write_tokens"))
     output_tokens = _safe_int(usage.get("output_tokens"))
     reasoning = _safe_int(usage.get("reasoning_output_tokens"))
     total = _safe_int(usage.get("total_tokens"))
@@ -561,6 +585,7 @@ def _event_from_usage(
         "measurement_basis": "provider_reported_token",
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_input_tokens,
+        "cache_write_input_tokens": cache_write_input_tokens,
         "output_tokens": output_tokens,
         "reasoning_output_tokens": reasoning,
         "total_tokens": total,
@@ -992,6 +1017,7 @@ def record_conversion_event(
         "measurement_basis": _text(measurement_basis) or DETERMINISTIC_BASIS,
         "input_tokens": None,
         "cached_input_tokens": None,
+        "cache_write_input_tokens": None,
         "output_tokens": None,
         "reasoning_output_tokens": None,
         "total_tokens": None,
@@ -1030,6 +1056,8 @@ def _empty_metrics() -> dict[str, Any]:
         "estimated_ratio": None,
         "savings_ratio": None,
         "measured_input": None,
+        "measured_cached_input": None,
+        "measured_cache_write_input": None,
         "measured_output": None,
         "measured_derived_total": None,
         "measured_total": None,
@@ -1038,6 +1066,11 @@ def _empty_metrics() -> dict[str, Any]:
         "measured_total_coverage": {
             "provider_reported": "none",
             "input_output_derived": "none",
+            "measured_event_count": 0,
+        },
+        "measured_cache_coverage": {
+            "cache_read": "unavailable",
+            "cache_write": "unavailable",
             "measured_event_count": 0,
         },
         "conversion_count": 0,
@@ -1050,6 +1083,15 @@ def _metrics(rows: list[sqlite3.Row]) -> dict[str, Any]:
     measured = [row for row in rows if row["event_kind"] == "measured"]
     estimated = [row for row in rows if row["event_kind"] == "conversion" and row["measurement_basis"] == DETERMINISTIC_BASIS]
     result["measured_input"] = _sum_or_none(row["input_tokens"] for row in measured)
+    columns = set(measured[0].keys()) if measured else set()
+    if "cached_input_tokens" in columns:
+        result["measured_cached_input"] = _sum_or_none(
+            row["cached_input_tokens"] for row in measured
+        )
+    if "cache_write_input_tokens" in columns:
+        result["measured_cache_write_input"] = _sum_or_none(
+            row["cache_write_input_tokens"] for row in measured
+        )
     result["measured_output"] = _sum_or_none(row["output_tokens"] for row in measured)
     result["measured_total"] = _sum_or_none(row["total_tokens"] for row in measured)
     result["measured_event_count"] = len(measured)
@@ -1079,6 +1121,19 @@ def _metrics(rows: list[sqlite3.Row]) -> dict[str, Any]:
             "complete" if measured and len(derived_total_rows) == len(measured)
             else "partial" if derived_total_rows else "none"
         ),
+        "measured_event_count": len(measured),
+    }
+    result["measured_cache_coverage"] = {
+        "cache_read": (
+            "complete" if measured and all(row["cached_input_tokens"] is not None for row in measured)
+            else "partial" if any(row["cached_input_tokens"] is not None for row in measured)
+            else "unavailable"
+        ) if "cached_input_tokens" in columns else "unavailable",
+        "cache_write": (
+            "complete" if measured and all(row["cache_write_input_tokens"] is not None for row in measured)
+            else "partial" if any(row["cache_write_input_tokens"] is not None for row in measured)
+            else "unavailable"
+        ) if "cache_write_input_tokens" in columns else "unavailable",
         "measured_event_count": len(measured),
     }
     result["conversion_count"] = sum(
@@ -1370,6 +1425,8 @@ def get_usage_summary(
         "measurement_notice": (
             "Provider token totals are measured host reports. MemoryGuard baseline/delivered "
             "units are deterministic estimates; they are not billing-token equivalents. "
+            "Cache-read and cache-write fields are reported only when the host source provides "
+            "them; missing fields remain unavailable. "
             "Savings ratio is shown only for conversion events using mg_deterministic_unit. "
             "Unavailable providers are not treated as zero usage."
         ),
