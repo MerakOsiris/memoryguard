@@ -45,6 +45,19 @@ from .runtime_v2.public_safety import (
     sanitize_public_payload,
     v2_upgrade_payload,
 )
+from .response_budget import (
+    BindingRevision,
+    DEFAULT_RESPONSE_BUDGET_BYTES,
+    GLOBAL_RESPONSE_STORE,
+    ResponseReferenceError,
+    ResponseScope,
+    compact_success_envelope,
+    digest as response_digest,
+    json_bytes as response_json_bytes,
+    json_text as response_json_text,
+    paged_summary,
+    unavailable_summary,
+)
 
 
 # MCP mutation classification has one source of truth.  This gate controls
@@ -730,7 +743,7 @@ def _v2_port_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _v2_result_envelope(result: Any) -> dict[str, Any]:
-    """Keep the existing CallToolResult envelope for facade responses."""
+    """Keep facade CallToolResult shape while compacting JSON text blocks."""
     if isinstance(result, dict) and "content" in result:
         if result.get("isError"):
             # Facade-provided error text is untrusted.  Preserve a structured
@@ -743,12 +756,202 @@ def _v2_result_envelope(result: Any) -> dict[str, Any]:
             payload["content"] = [{"type": "text", "text": f"error: {code}"}]
             payload["isError"] = True
             return payload
-        return result
+        return compact_success_envelope(result)
     if isinstance(result, dict) and result.get("error"):
         payload = sanitize_public_payload(dict(result), error_code="v2_dispatch_failed")
         payload.setdefault("ok", False)
         return _mcp_json_error(payload)
-    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
+    return {"content": [{"type": "text", "text": response_json_text(result)}]}
+
+
+_RESPONSE_READ_OPERATION = "memoryguard_response_read"
+_RESPONSE_PAGING_ARGUMENTS = frozenset({
+    "response_ref", "response_fields", "response_offset", "response_limit",
+})
+
+
+def _response_context_scope(context: Any) -> ResponseScope:
+    if isinstance(context, Mapping):
+        return ResponseScope.from_mapping(context)
+    return ResponseScope.from_mapping({
+        key: getattr(context, key, "")
+        for key in (
+            "workspace_id", "share_group_id", "agent_instance_id", "project_ref",
+            "provider", "runtime_role", "session_id", "session_source",
+            "session_trusted", "context_hash", "namespace_id", "sensitivity",
+            "policy_class",
+        )
+    })
+
+
+def _response_binding_revision(workspace: Path, context: Any) -> BindingRevision:
+    """Read one active binding row; never enumerate a group or data source."""
+
+    if isinstance(context, Mapping):
+        agent = str(context.get("agent_instance_id") or "")
+        group = str(context.get("share_group_id") or "")
+    else:
+        agent = str(getattr(context, "agent_instance_id", "") or "")
+        group = str(getattr(context, "share_group_id", "") or "")
+    if not agent or not group:
+        raise ResponseReferenceError("response_ref_access_denied")
+    try:
+        from .runtime_v2.group_native import GroupControlService
+
+        binding = GroupControlService(workspace, write=False).active_binding_for_agent(agent)
+    except Exception as exc:
+        raise ResponseReferenceError("response_ref_access_denied") from exc
+    if not isinstance(binding, Mapping) or str(binding.get("share_group_id") or "") != group:
+        raise ResponseReferenceError("response_ref_access_denied")
+    revision = binding.get("revision")
+    if type(revision) is not int or revision < 1:
+        raise ResponseReferenceError("response_ref_access_denied")
+    binding_id = str(binding.get("binding_id") or "")
+    if not binding_id:
+        raise ResponseReferenceError("response_ref_access_denied")
+    return BindingRevision(binding_id, revision, group, agent)
+
+
+def _response_is_public_catalog(name: str, args: Mapping[str, Any]) -> bool:
+    if name == "memoryguard_capabilities":
+        return True
+    return (
+        name == "memoryguard_invoke"
+        and str(args.get("operation") or "") == "memoryguard_capabilities"
+    )
+
+
+def _response_replayable_read(name: str, args: Mapping[str, Any]) -> bool:
+    """Only ordinary reads may be re-dispatched during reference paging."""
+
+    if name in _DB_WRITING_TOOLS or name == _RESPONSE_READ_OPERATION:
+        return False
+    if name != "memoryguard_invoke":
+        return name not in _MUTATING_TOOLS
+    target = str(args.get("operation") or "")
+    if target == _RESPONSE_READ_OPERATION:
+        return False
+    return (
+        target not in _MUTATING_TOOLS
+        and target not in GUI_MUTATION_NAMES
+        and target not in _DB_WRITING_TOOLS
+    )
+
+
+def _validate_response_paging_arguments(name: str, args: Mapping[str, Any]) -> None:
+    """Reject response paging before a write reaches any handler."""
+
+    if name in _MUTATING_TOOLS and any(key in args for key in _RESPONSE_PAGING_ARGUMENTS):
+        raise ValueError("response_pagination_read_only")
+    if name != "memoryguard_invoke":
+        return
+    target = str(args.get("operation") or "")
+    nested = args.get("arguments")
+    if target in _MUTATING_TOOLS or target in GUI_MUTATION_NAMES:
+        if isinstance(nested, Mapping) and any(key in nested for key in _RESPONSE_PAGING_ARGUMENTS):
+            raise ValueError("response_pagination_read_only")
+
+
+def _revalidate_response_read(
+    name: str,
+    args: Mapping[str, Any],
+    workspace: Path,
+    expected_digest: str,
+) -> str | None:
+    """Re-run the original read internally; changed data never exposes a snapshot."""
+
+    replayed = _v2_cutover_dispatch(name, deepcopy(dict(args)), workspace)
+    if not isinstance(replayed, Mapping) or replayed.get("isError"):
+        return "response_ref_expired"
+    replayed = _hidden_tool_deprecation(dict(replayed), name)
+    if response_digest(compact_success_envelope(replayed)) != expected_digest:
+        return "response_ref_result_changed"
+    return None
+
+
+def _read_response_reference(args: Mapping[str, Any], workspace: Path) -> dict[str, Any]:
+    """Serve one bounded response page through the broker-only extension."""
+
+    nested = args.get("arguments")
+    if not isinstance(nested, Mapping):
+        return _mcp_json_error({"ok": False, "error": "broker_arguments_invalid", "code": "broker_arguments_invalid"})
+    if set(nested) - {"response_ref", "fields", "offset", "limit"}:
+        return _mcp_json_error({"ok": False, "error": "response_arguments_invalid", "code": "response_arguments_invalid"})
+    response_ref = nested.get("response_ref")
+    if not isinstance(response_ref, str):
+        return _mcp_json_error({"ok": False, "error": "response_ref_invalid", "code": "response_ref_invalid"})
+    try:
+        public = GLOBAL_RESPONSE_STORE.is_public(response_ref)
+        scope = None
+        binding = None
+        if not public:
+            context, error = _trusted_context_for_v2(dict(args), workspace)
+            if error or context is None:
+                raise ResponseReferenceError("response_ref_access_denied")
+            scope = _response_context_scope(context)
+            binding = _response_binding_revision(workspace, context)
+        page = GLOBAL_RESPONSE_STORE.read(
+            response_ref,
+            scope=scope,
+            binding=binding,
+            fields=nested.get("fields"),
+            offset=nested.get("offset", 0),
+            limit=nested.get("limit", 3000),
+        )
+    except ResponseReferenceError as exc:
+        return _mcp_json_error({"ok": False, "error": exc.code, "code": exc.code})
+    result = _v2_result_envelope(page)
+    # Page text and selector names are JSON-encoded once more by the MCP
+    # envelope. Verify the actual outbound CallToolResult, not source limits.
+    # Never turn a page into another reference.
+    if len(response_json_bytes(result)) > DEFAULT_RESPONSE_BUDGET_BYTES:
+        return _mcp_json_error({
+            "ok": False,
+            "error": "response_page_too_large",
+            "code": "response_page_too_large",
+        })
+    return result
+
+
+def _budget_success_response(
+    result: dict[str, Any],
+    *,
+    name: str,
+    args: Mapping[str, Any],
+    workspace: Path,
+) -> dict[str, Any]:
+    """Apply response budget after every success wrapper has run."""
+
+    if result.get("isError") or not _response_replayable_read(name, args):
+        return compact_success_envelope(result)
+    compacted = compact_success_envelope(result)
+    if len(response_json_bytes(compacted)) <= DEFAULT_RESPONSE_BUDGET_BYTES:
+        return compacted
+    public = _response_is_public_catalog(name, args)
+    expected_digest = response_digest(compacted)
+    try:
+        if public:
+            scope = None
+            binding = None
+        else:
+            context, error = _trusted_context_for_v2(dict(args), workspace)
+            if error or context is None:
+                raise ResponseReferenceError("response_ref_access_denied")
+            scope = _response_context_scope(context)
+            binding = _response_binding_revision(workspace, context)
+        response_ref = GLOBAL_RESPONSE_STORE.put(
+            compacted,
+            scope=scope,
+            binding=binding,
+            public=public,
+            revalidate=lambda: _revalidate_response_read(name, args, workspace, expected_digest),
+        )
+    except ResponseReferenceError as exc:
+        # The read completed, but returning a giant body would violate the
+        # public budget. State delivery failure without pretending the source
+        # operation failed; writes/bootstrap never enter this branch.
+        return unavailable_summary(compacted, code=exc.code)
+    return paged_summary(compacted, response_ref)
 
 
 def _hidden_tool_deprecation(result: dict[str, Any], name: str) -> dict[str, Any]:
@@ -918,8 +1121,15 @@ def _v2_cutover_dispatch(name: str, args: dict[str, Any], workspace: Path) -> di
         except ValueError as exc:
             code = safe_error_code(exc, "invalid_tool_arguments")
             return _mcp_json_error({"ok": False, "error": code, "code": code})
+    try:
+        _validate_response_paging_arguments(name, args)
+    except ValueError as exc:
+        code = safe_error_code(exc, "invalid_tool_arguments")
+        return _mcp_json_error({"ok": False, "error": code, "code": code})
     broker_gui_target: tuple[str, dict[str, object]] | None = None
     if name == "memoryguard_invoke":
+        if str(args.get("operation") or "") == _RESPONSE_READ_OPERATION:
+            return _read_response_reference(args, workspace)
         try:
             target_surface, target, target_args = resolve_mcp_broker_invocation(
                 args,
@@ -1057,6 +1267,8 @@ def _v2_cutover_dispatch(name: str, args: dict[str, Any], workspace: Path) -> di
 
 def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Dispatch MCP exclusively through the V2 state gate."""
+    workspace: Path | None = None
+    request_args: dict[str, Any] = {}
     try:
         # Transport arguments are request-owned data.  Native handlers are
         # allowed to normalize/pop transport fields, but never on the
@@ -1077,7 +1289,15 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             result = _mcp_json_error(payload)
     if result is None:
         result = _mcp_json_error(v2_upgrade_payload("UNKNOWN", surface="MCP"))
-    return _hidden_tool_deprecation(result, name)
+    result = _hidden_tool_deprecation(result, name)
+    if workspace is None:
+        return compact_success_envelope(result) if not result.get("isError") else result
+    return _budget_success_response(
+        result,
+        name=name,
+        args=request_args,
+        workspace=workspace,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1213,7 +1433,7 @@ def serve_stdio() -> int:
                 continue
             response = handle_request(request)
             if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+                sys.stdout.write(response_json_text(response) + "\n")
                 sys.stdout.flush()
         return 0
     finally:

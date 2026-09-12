@@ -22,6 +22,8 @@ CORE_TOOL_NAMES = frozenset({
     "memoryguard_memory_status",
     "memoryguard_audit",
     "memoryguard_explain",
+    "memoryguard_capabilities",
+    "memoryguard_invoke",
 })
 
 
@@ -80,6 +82,18 @@ CORE_TOOL_ANNOTATIONS = {
         "idempotentHint": True,
         "openWorldHint": False,
     },
+    "memoryguard_capabilities": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    "memoryguard_invoke": {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
 }
 
 
@@ -93,6 +107,8 @@ CORE_DESCRIPTION_BOUNDARIES = {
     "memoryguard_memory_status": ("use when", "do not use"),
     "memoryguard_audit": ("use when", "do not use"),
     "memoryguard_explain": ("use when", "do not use"),
+    "memoryguard_capabilities": ("discover", "requires no"),
+    "memoryguard_invoke": ("invoke", "never accepts"),
 }
 
 
