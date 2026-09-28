@@ -387,6 +387,7 @@ class MemoryAtomStore:
         path: str | Path | None = None,
         readonly: bool = False,
         read_only: bool | None = None,
+        initialize: bool = True,
     ) -> None:
         if read_only is not None:
             readonly = bool(read_only)
@@ -409,10 +410,18 @@ class MemoryAtomStore:
         # group.  Keep this thread-local so ordinary governed writers remain
         # independent when a host performs a background shadow build.
         self._migration_state = threading.local()
-        if self.readonly:
+        if self.readonly or not initialize:
             if not self.db_path.is_file():
                 raise FileNotFoundError(self.db_path)
-            self._check_schema()
+            # Native runtime leases have already checked the complete schema.
+            # Keep construction read-only, even for a later writable store:
+            # opening RO/RW WAL handles together can leave Windows SQLite with
+            # a read-only SHM mapping. Migrations belong to explicit startup.
+            conn = self._checked_connect(readonly=True)
+            try:
+                self._check_schema_connection(conn)
+            finally:
+                conn.close()
         else:
             # Existing databases are inspected through mode=ro before any
             # writable SQLite handle is opened.  This matters on older SQLite
@@ -435,6 +444,11 @@ class MemoryAtomStore:
 
     def _checked_connect(self, *, readonly: bool | None = None) -> sqlite3.Connection:
         self.layout.assert_database_path(self.db_path, "memory")
+        from ..governance_v2.atomic import memory_connection
+
+        borrowed = memory_connection(self.db_path)
+        if borrowed is not None:
+            return borrowed
         return connect_database(self.db_path, readonly=self.readonly if readonly is None else readonly)
 
     def _preflight_write_schema(self) -> None:

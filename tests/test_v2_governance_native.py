@@ -531,3 +531,306 @@ def test_all_deleted_conflict_can_be_closed_without_resurrection(tmp_path: Path)
             memory_id, scope=mutation.to_dict(), include_building=True,
         )
         assert atom is not None and atom.status == "deleted"
+
+
+def test_referenced_resolved_peer_is_readable_but_not_rewritten(tmp_path: Path) -> None:
+    boundary = _seed(tmp_path)
+    mutation = _mutation_context(tmp_path)
+    context = _native_context(tmp_path)
+    port = _port(tmp_path)
+    workspace = str(tmp_path.resolve())
+
+    def put(memory_id, body, metadata, *, status="active", runtime_role="gui", share_group_id="group-a", agent="agent-a", injection_policy="relevant"):
+        ctx = V2MutationContext(
+            workspace_id=workspace,
+            share_group_id=share_group_id,
+            agent_instance_id=agent,
+            project_ref=workspace,
+            provider="gui",
+            runtime_role=runtime_role,
+            actor=agent,
+            authority="admin",
+            admin=True,
+        )
+        boundary.put_atom(
+            MemoryAtom(
+                memory_id=memory_id,
+                body=body,
+                status=status,
+                injection_policy=injection_policy,
+                share_group_id=share_group_id,
+                agent_instance_id=agent,
+                project_ref=workspace,
+                provider="gui",
+                runtime_role=runtime_role,
+                metadata=metadata,
+            ),
+            context=ctx,
+            evidence=[{
+                "source_ref": f"test:{share_group_id}:{memory_id}:{runtime_role}",
+                "digest": f"digest-{share_group_id}-{memory_id}-{runtime_role}",
+            }],
+            reason=f"seed {memory_id}",
+            idempotency_key=f"seed:{share_group_id}:{memory_id}:{runtime_role}:{status}",
+        )
+
+    put("peer-kept", "peer body stays", {
+        "conflict_group_id": "conflict-old-resolved",
+        "conflict_status": "resolved",
+        "conflict_resolution": "kept",
+    })
+    put("candidate-keep", "candidate keep body", {
+        "conflict_group_id": "conflict-new-keep",
+        "conflict_status": "unresolved",
+        "conflict_reason": "same logical fact disagrees",
+        "conflict_peer_ids": ["peer-kept", "missing-peer-id", "other-group-secret"],
+    }, status="conflicted")
+    put("candidate-close", "candidate close body", {
+        "conflict_group_id": "conflict-new-close",
+        "conflict_status": "unresolved",
+        "conflict_reason": "same logical fact disagrees",
+        "conflict_peer_ids": ["peer-kept"],
+    }, status="conflicted")
+    put("other-group-secret", "secret other group", {}, share_group_id="group-b", agent="agent-b")
+    put("peer-loser", "peer loser body", {
+        "conflict_group_id": "conflict-old-loser",
+        "conflict_status": "resolved",
+        "conflict_resolution": "kept",
+    })
+    put("candidate-own", "candidate own body", {
+        "conflict_group_id": "conflict-keep-candidate",
+        "conflict_status": "unresolved",
+        "conflict_reason": "same logical fact disagrees",
+        "conflict_peer_ids": ["peer-loser"],
+    }, status="conflicted")
+    put("peer-always", "always peer body", {}, injection_policy="always")
+    put("candidate-always", "always candidate", {
+        "conflict_group_id": "conflict-always",
+        "conflict_status": "unresolved",
+        "conflict_peer_ids": ["peer-always"],
+    }, status="conflicted")
+    def listed_groups():
+        result = port.dispatch_gui(
+            "get_conflicts", ["group-a"], context=context, generation=11, state="V2_ACTIVE",
+        )
+        assert result["ok"] is True, result
+        return {item["group_id"]: item for item in result["data"]["conflicts"]}, result
+
+    groups, payload = listed_groups()
+    assert "conflict-old-resolved" not in groups
+    assert "secret other group" not in str(payload)
+    current = groups["conflict-new-keep"]
+    details = {item["memory_id"]: item for item in current["members"]}
+    assert details["peer-kept"]["snapshot_status"] == "snapshot_available"
+    assert details["peer-kept"]["preview"] == "peer body stays"
+    assert details["peer-kept"]["missing"] is False
+    assert details["missing-peer-id"]["missing"] is True
+    assert details["missing-peer-id"]["snapshot_status"] == "snapshot_unavailable"
+    assert details["other-group-secret"]["missing"] is True
+    assert details["other-group-secret"]["snapshot_status"] == "snapshot_unavailable"
+    assert current["can_resolve"] is True
+    blocked = port.dispatch_gui(
+        "close_stale_conflict", [None, "conflict-new-keep", "group-a"],
+        context=context, generation=11, mutation=True, state="V2_ACTIVE",
+    )
+    assert blocked["ok"] is False
+    assert blocked["error"] == "conflict_group_actionable"
+    protected = port.dispatch_gui(
+        "resolve_conflict", ["conflict-always", "candidate-always", "group-a"],
+        context=context, generation=11, mutation=True, state="V2_ACTIVE",
+    )
+    assert protected["ok"] is False
+    assert protected["error"] == "conflict_always_rule_protected"
+    always_peer = boundary.memory.get_atom("peer-always", scope=mutation.to_dict(), include_building=True)
+    assert always_peer is not None and always_peer.status == "active"
+
+    owned = port.dispatch_gui(
+        "resolve_conflict", ["conflict-keep-candidate", "candidate-own", "group-a"],
+        context=context, generation=11, mutation=True, state="V2_ACTIVE",
+    )
+    assert owned["ok"] is True, owned
+    groups, _payload = listed_groups()
+    assert "conflict-keep-candidate" not in groups
+    loser = boundary.memory.get_atom("peer-loser", scope=mutation.to_dict(), include_building=True)
+    assert loser is not None and loser.status == "deleted"
+    kept_candidate = boundary.memory.get_atom("candidate-own", scope=mutation.to_dict(), include_building=True)
+    assert kept_candidate is not None
+    assert kept_candidate.metadata["conflict_status"] == "resolved"
+    assert kept_candidate.metadata["conflict_resolution"] == "kept"
+
+    resolved = port.dispatch_gui(
+        "resolve_conflict", ["conflict-new-keep", "peer-kept", "group-a"],
+        context=context, generation=11, mutation=True, state="V2_ACTIVE",
+    )
+    assert resolved["ok"] is True, resolved
+    groups, _payload = listed_groups()
+    assert "conflict-new-keep" not in groups
+    peer = boundary.memory.get_atom("peer-kept", scope=mutation.to_dict(), include_building=True)
+    assert peer is not None
+    assert peer.body == "peer body stays"
+    assert peer.status == "active"
+    assert peer.metadata["conflict_group_id"] == "conflict-old-resolved"
+    assert peer.metadata["conflict_status"] == "resolved"
+    assert peer.metadata["conflict_resolution"] == "kept"
+    peer_before = (peer.revision, peer.status, peer.body, dict(peer.metadata))
+
+    boundary.tombstone("candidate-close", context=mutation, reason="candidate removed")
+    closed = port.dispatch_gui(
+        "close_stale_conflict", [None, "conflict-new-close", "group-a"],
+        context=context, generation=11, mutation=True, state="V2_ACTIVE",
+    )
+    assert closed["ok"] is True, closed
+    groups, _payload = listed_groups()
+    assert "conflict-new-close" not in groups
+    peer = boundary.memory.get_atom("peer-kept", scope=mutation.to_dict(), include_building=True)
+    assert peer is not None
+    assert (peer.revision, peer.status, peer.body, dict(peer.metadata)) == peer_before
+
+
+def test_resolve_tombstone_failure_rolls_back_resolved_mark(tmp_path: Path, monkeypatch) -> None:
+    from memoryguard.governance_v2.boundary import V2GovernanceBoundary
+
+    boundary = _seed(tmp_path)
+    mutation = _mutation_context(tmp_path)
+    context = _native_context(tmp_path)
+    workspace = str(tmp_path.resolve())
+    boundary.put_atom(
+        MemoryAtom(
+            memory_id="peer-kept",
+            body="peer body stays",
+            share_group_id="group-a",
+            agent_instance_id="agent-a",
+            project_ref=workspace,
+            provider="gui",
+            runtime_role="gui",
+            metadata={
+                "conflict_group_id": "conflict-old-resolved",
+                "conflict_status": "resolved",
+                "conflict_resolution": "kept",
+            },
+        ),
+        context=mutation,
+        evidence=[{"source_ref": "test:peer-kept", "digest": "digest-peer-kept"}],
+        reason="seed peer",
+        idempotency_key="seed:rollback:peer",
+    )
+    boundary.put_atom(
+        MemoryAtom(
+            memory_id="candidate-keep",
+            body="candidate keep body",
+            status="conflicted",
+            share_group_id="group-a",
+            agent_instance_id="agent-a",
+            project_ref=workspace,
+            provider="gui",
+            runtime_role="gui",
+            metadata={
+                "conflict_group_id": "conflict-new-keep",
+                "conflict_status": "unresolved",
+                "conflict_peer_ids": ["peer-kept"],
+            },
+        ),
+        context=mutation,
+        evidence=[{"source_ref": "test:candidate-keep", "digest": "digest-candidate-keep"}],
+        reason="seed candidate",
+        idempotency_key="seed:rollback:candidate",
+    )
+
+    def fail_tombstone(self, *args, **kwargs):
+        raise RuntimeError("injected tombstone failure")
+
+    monkeypatch.setattr(V2GovernanceBoundary, "tombstone", fail_tombstone)
+    refused = _port(tmp_path).dispatch_gui(
+        "resolve_conflict", ["conflict-new-keep", "peer-kept", "group-a"],
+        context=context, generation=11, mutation=True, state="V2_ACTIVE",
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "conflict_resolution_failed"
+    candidate = boundary.memory.get_atom("candidate-keep", scope=mutation.to_dict(), include_building=True)
+    peer = boundary.memory.get_atom("peer-kept", scope=mutation.to_dict(), include_building=True)
+    assert candidate is not None and peer is not None
+    assert candidate.status == "conflicted"
+    assert candidate.metadata["conflict_status"] == "unresolved"
+    assert "conflict_resolution" not in candidate.metadata
+    assert peer.status == "active"
+    assert peer.metadata["conflict_group_id"] == "conflict-old-resolved"
+    assert peer.metadata["conflict_resolution"] == "kept"
+
+
+def test_ambiguous_peer_blocks_resolve_and_close(tmp_path: Path, monkeypatch) -> None:
+    boundary = _seed(tmp_path)
+    mutation = _mutation_context(tmp_path)
+    context = _native_context(tmp_path)
+    workspace = str(tmp_path.resolve())
+    boundary.put_atom(
+        MemoryAtom(
+            memory_id="candidate-ambiguous",
+            body="ambiguous candidate",
+            status="conflicted",
+            share_group_id="group-a",
+            agent_instance_id="agent-a",
+            project_ref=workspace,
+            provider="gui",
+            runtime_role="gui",
+            metadata={
+                "conflict_group_id": "conflict-ambiguous",
+                "conflict_status": "unresolved",
+                "conflict_peer_ids": ["ambiguous-peer", "missing-peer-id"],
+            },
+        ),
+        context=mutation,
+        evidence=[{"source_ref": "test:candidate-ambiguous", "digest": "digest-candidate-ambiguous"}],
+        reason="seed ambiguous candidate",
+        idempotency_key="seed:ambiguous:candidate",
+    )
+    original = GovernanceNativeService._conflict_sources
+
+    def stub(self, trusted):
+        atoms, buckets = original(self, trusted)
+        shared = dict(
+            memory_id="ambiguous-peer",
+            status="active",
+            share_group_id="group-a",
+            agent_instance_id="agent-a",
+            project_ref=workspace,
+            provider="gui",
+            runtime_role="gui",
+        )
+        buckets["ambiguous-peer"] = [
+            MemoryAtom(atom_id="atom-low", body="ambiguous low", **shared),
+            MemoryAtom(atom_id="atom-high", body="ambiguous high", revision=9, **shared),
+        ]
+        return atoms, buckets
+
+    monkeypatch.setattr(GovernanceNativeService, "_conflict_sources", stub)
+    port = _port(tmp_path)
+    listed = port.dispatch_gui(
+        "get_conflicts", ["group-a"], context=context, generation=11, state="V2_ACTIVE",
+    )
+    assert listed["ok"] is True, listed
+    current = {item["group_id"]: item for item in listed["data"]["conflicts"]}["conflict-ambiguous"]
+    details = {item["memory_id"]: item for item in current["members"]}
+    assert details["ambiguous-peer"]["status"] == "ambiguous"
+    assert details["ambiguous-peer"]["selectable"] is False
+    assert details["missing-peer-id"]["missing"] is True
+    assert details["missing-peer-id"]["snapshot_status"] == "snapshot_unavailable"
+    assert current["can_resolve"] is False
+    assert current["status"] == "ambiguous"
+    refused = port.dispatch_gui(
+        "resolve_conflict", ["conflict-ambiguous", "candidate-ambiguous", "group-a"],
+        context=context, generation=11, mutation=True, state="V2_ACTIVE",
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "conflict_member_ambiguous"
+    closed = port.dispatch_gui(
+        "close_stale_conflict", [None, "conflict-ambiguous", "group-a"],
+        context=context, generation=11, mutation=True, state="V2_ACTIVE",
+    )
+    assert closed["ok"] is False
+    assert closed["error"] == "conflict_member_ambiguous"
+    candidate = boundary.memory.get_atom(
+        "candidate-ambiguous", scope=mutation.to_dict(), include_building=True,
+    )
+    assert candidate is not None
+    assert candidate.status == "conflicted"
+    assert candidate.metadata["conflict_status"] == "unresolved"

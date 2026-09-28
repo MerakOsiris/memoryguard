@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/irisxc4/memoryguard",
-  "version": "0.7.12",
+  "version": "0.7.13",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "agent-memguard",
-      "version": "0.7.12",
+      "version": "0.7.13",
       "runtimeHint": "python",
       "packageArguments": [
         {

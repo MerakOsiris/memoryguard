@@ -100,7 +100,7 @@ restore_memory revoke_rule_exception rollback_memory rollback_native_memory_rele
 run_audit scan_sources search_history search_memory set_governance_scope set_host_hook_mode
 set_memory_injection_policy set_projection_source_enabled start_build_projection submit_rule_feedback
 sync_usage_telemetry unbind_agent undo_change undo_rule_decision uninstall_host_hook unlock_memory
-unmark_agent_uninstalled update_rule_audience verify_release
+unmark_agent_uninstalled update_rule_audience update_rule_body verify_release
 """.split())
 _MCP_BROKER_UNAVAILABLE = {
     "pick_path": "desktop_only",
@@ -357,6 +357,7 @@ _add(
 _add("list_rule_match_receipts", "rule_receipts", "rules", "read", "gui_rule_receipts", parameters=("share_group_id", "memory_id", "agent_instance_id", "limit"))
 _add("list_rule_exceptions", "rule_exceptions", "rules", "read", "gui_rule_exceptions", parameters=("share_group_id", "parent_rule"))
 _add("update_rule_audience", "rule_audience_update", "rules", "mutation", "gui_rule_audience_update", parameters=("memory_id", "assignments", "share_group_id", "injection_policy", "priority", "confirmed"))
+_add("update_rule_body", "rule_body_update", "rules", "mutation", "gui_rule_body_update", parameters=("definition_id", "body", "expected_revision", "share_group_id"))
 _add("create_rule_from_text", "rule_create", "rules", "mutation", "gui_rule_create", parameters=("text",))
 _add("submit_rule_feedback", "rule_feedback", "rules", "mutation", "gui_rule_feedback", parameters=("receipt_id", "outcome", "evidence", "confidence"))
 _add("undo_rule_decision", "rule_undo", "rules", "mutation", "gui_rule_undo", parameters=("decision_id", "share_group_id", "confirmed", "metadata"))
@@ -513,7 +514,7 @@ MCP_BROKER_GUI_ADMIN_NAMES = frozenset({
     "dissolve_shared_group", "export_memory_group", "clear_memory_group",
     "archive_memory_group", "install_shared_group_mcp_redirects",
     "import_native_memories_to_group", "commit_shared_memory_governance",
-    "enter_multi_agent_mode", "exit_multi_agent_mode", "update_rule_audience",
+    "enter_multi_agent_mode", "exit_multi_agent_mode", "update_rule_audience", "update_rule_body",
     "set_host_hook_mode", "uninstall_host_hook",
 })
 MCP_BROKER_GUI_HOST_BOUND_NAMES = frozenset({
@@ -536,6 +537,7 @@ def gui_registry_payload() -> dict[str, dict[str, object]]:
 CLI_COMMAND_NAMES = frozenset({
     "audit", "open", "explain", "plan", "apply", "verify", "undo", "source", "scan",
     "import", "provider", "gc", "storage", "gui", "desktop", "hooks", "mcp-status", "doctor", "groups",
+    "runtime",
 })
 
 RULE_MUTATION_MCP_NAMES = frozenset({

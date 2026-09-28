@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.7.13] - 2026-09-28
+
+### Changed
+
+- Mandatory-rule replacements validate the final package using audience
+  matching, canonical heads, deduplication, sensitivity checks, and publication
+  budgets. Equivalent unlocked predecessors retire atomically; handled failures
+  roll back the replacement, revisions, evidence, and receipts.
+- Native `agent`/`group` audience matching and deduplication no longer split
+  the same audience solely by provider or runtime role. Distinct Agent
+  identities remain separate; project-scoped audiences remain project-specific.
+  Provider repair uses the target provider's verified Agent identity.
+- Cursor MemoryGuard Hooks use a 30-second timeout and retain
+  `failClosed: true`.
+
+### Fixed
+
+- Conflict views keep peer members readable. Resolution preserves external peer
+  groups and applies the selected changes atomically; ambiguous conflicts
+  cannot be resolved or closed.
+
 ## [0.7.12] - 2026-09-12
 
 ### Added

@@ -771,6 +771,78 @@ def runtime_lease_status(
     }
 
 
+def describe_split_brain(
+    status: dict[str, Any],
+    *,
+    control_workspace: str | Path | None = None,
+) -> dict[str, Any]:
+    """Render a lease result into operator-facing text.
+
+    Accepts the output of :func:`runtime_lease_status` or
+    :func:`check_runtime_lease`.  Every surface that has to explain a
+    split brain (hook denial, doctor, upgrade epilogue, reap) formats it
+    through here so the wording and the suggested command stay identical.
+    """
+    conflicts = list(status.get("conflicting") or [])
+    if not conflicts:
+        return {
+            "split_brain": False,
+            "pids": [],
+            "summary": "",
+            "detail_lines": [],
+            "remedy": "",
+        }
+
+    pids: list[int] = []
+    detail_lines: list[str] = []
+    for lease in conflicts:
+        try:
+            pid = int(lease.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        pids.append(pid)
+        detail_lines.append(
+            "  pid={pid} version={ver} started={started}".format(
+                pid=pid,
+                ver=str(lease.get("memoryguard_version", "") or "?"),
+                started=str(lease.get("process_started_at", "") or "?"),
+            )
+        )
+
+    ws = str(Path(control_workspace).resolve()) if control_workspace else ""
+    remedy = "memoryguard runtime reap" + (f' -w "{ws}"' if ws else "")
+    summary = (
+        "runtime_split_brain: {n} 个仍在运行的进程以不同构建持有同一个 workspace，"
+        "为保护数据一致性已拒绝写入。冲突 PID: {pids}".format(
+            n=len(pids), pids=", ".join(str(p) for p in pids) or "?"
+        )
+    )
+    return {
+        "split_brain": True,
+        "pids": pids,
+        "summary": summary,
+        "detail_lines": detail_lines,
+        "remedy": remedy,
+    }
+
+
+def split_brain_hint(
+    control_workspace: str | Path,
+    *,
+    leases_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Best-effort read-only split-brain probe.
+
+    Never raises and never writes: callers use it on failure paths where an
+    extra exception would replace a useful message with silence.
+    """
+    try:
+        status = runtime_lease_status(control_workspace, leases_path=leases_path)
+    except Exception:
+        return {"split_brain": False, "pids": [], "summary": "", "detail_lines": [], "remedy": ""}
+    return describe_split_brain(status, control_workspace=control_workspace)
+
+
 if __name__ == "__main__":  # pragma: no cover - manual smoke
     result = check_runtime_lease(sys.argv[1] if len(sys.argv) > 1 else ".")
     print(json.dumps(result, ensure_ascii=False, indent=2))

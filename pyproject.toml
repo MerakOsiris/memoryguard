@@ -1,6 +1,6 @@
 [project]
 name = "agent-memguard"
-version = "0.7.12"
+version = "0.7.13"
 description = "Local-first MCP memory backend and governance console for coding agents"
 readme = "README.md"
 requires-python = ">=3.10"

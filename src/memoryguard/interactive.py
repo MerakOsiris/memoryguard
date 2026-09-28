@@ -1997,7 +1997,7 @@ function agentDisplayName(agentOrId, fallback = '未知助手') {
     || fallbackLabel
     || (readableAgentPart(program, id) && readableAgentPart(provider, id) ? `${program} · ${provider}` : '')
     || (readableAgentPart(provider, id) && readableAgentPart(project, id) ? `${provider} · ${project}` : '');
-  const productLabels = {codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor', trae: 'Trae', grok: 'Grok', chatgpt: 'ChatGPT', copilot: 'GitHub Copilot'};
+  const productLabels = {codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor', trae: 'Trae', grok: 'Grok', workbuddy: 'WorkBuddy', chatgpt: 'ChatGPT', copilot: 'GitHub Copilot'};
   const family = agentFamily(match || agentOrId);
   // Provider/program/display_name are identity hints, not user-facing names.
   // Collapse known product slugs to family labels; keep opaque IDs in details.
@@ -2022,6 +2022,7 @@ function agentFamily(agentOrId) {
   const text = [item.provider, item.provider_name, item.product, item.display_name, item.agent_name, item.member_name,
     item.program_name, item.program, item.client_name, item.host_name,
     typeof agentOrId === 'string' ? agentOrId : ''].join(' ').toLowerCase();
+  if (/workbuddy/.test(text)) return 'workbuddy';
   if (/grok|xai|x\.ai/.test(text)) return 'grok';
   if (/trae(?:\b|[-_.])|trae\.ai/.test(text)) return 'trae';
   if (/codex|openai-codex/.test(text)) return 'codex';
@@ -2043,6 +2044,7 @@ function agentIconMarkup(agentOrId) {
     cursor: '<svg class="agent-icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M11.503.131 1.891 5.678a.84.84 0 0 0-.42.726v11.188c0 .3.162.575.42.724l9.609 5.55a1 1 0 0 0 .998 0l9.61-5.55a.84.84 0 0 0 .42-.724V6.404a.84.84 0 0 0-.42-.726L12.497.131a1.01 1.01 0 0 0-.996 0M2.657 6.338h18.55c.263 0 .43.287.297.515L12.23 22.918c-.062.107-.229.064-.229-.06V12.335a.59.59 0 0 0-.295-.51l-9.11-5.257c-.109-.063-.064-.23.061-.23"/></svg>',
     trae: '<svg class="agent-icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M24 20.5H3.5V17H0V3.5h24ZM3.5 17h17V7h-17Zm8.5-5-2.5 2.5L7 12l2.5-2.5Zm7 0-2.5 2.5L14 12l2.5-2.5z"/></svg>',
     grok: '<span class="agent-mark-text">Grok</span>',
+    workbuddy: '<span class="agent-mark-text">WorkBuddy</span>',
     chatgpt: '<svg class="agent-icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4.1a4.2 4.2 0 0 1 7.2 3 4.2 4.2 0 0 1 1 7.8 4.2 4.2 0 0 1-4.2 5.8 4.2 4.2 0 0 1-7.2 0 4.2 4.2 0 0 1-5.1-5.8 4.2 4.2 0 0 1 1-7.8 4.2 4.2 0 0 1 7.3-3Z"/><path d="m8.1 15.6 7.8-4.5M8.5 9.4l7.8 4.5"/></svg>',
     copilot: '<svg class="agent-icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 8.1c0-2 1.6-3.6 3.6-3.6h1.5c1 0 1.9.4 2.6 1.1l.3.3.3-.3c.7-.7 1.6-1.1 2.6-1.1h1.5c2 0 3.6 1.6 3.6 3.6v7.8c0 2-1.6 3.6-3.6 3.6h-1.5c-1 0-1.9-.4-2.6-1.1l-.3-.3-.3.3c-.7.7-1.6 1.1-2.6 1.1H8.6c-2 0-3.6-1.6-3.6-3.6V8.1Z"/><path d="M8 10.5h3M13 10.5h3M8 14h3M13 14h3"/></svg>',
     unknown: '?',
@@ -4244,20 +4246,22 @@ function removeNeuronRuleBodyModal() {
 }
 
 function openNeuronRuleBodyEditor(memoryId) {
-  const node = (neuronGraph?.nodes || []).find(item => item.memory_id === memoryId && item.node_kind === 'virtual_rule_ref');
+  const node = ruleRecordsById.get(memoryId) || (neuronGraph?.nodes || []).find(item => item.memory_id === memoryId && item.node_kind === 'virtual_rule_ref');
   if (!memoryId || !node) return showToast('未找到可编辑的规则节点', 'error');
   removeNeuronRuleBodyModal();
   const modal = document.createElement('div');
   modal.id = 'neuron-rule-body-modal';
   modal.className = 'modal-backdrop';
+  modal.dataset.definitionId = node.definition_id || '';
+  modal.dataset.revision = String(node.revision || '');
   modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="编辑规则正文">
-    <div class="modal-head"><h3>编辑规则正文</h3><p>保存后写回同一条受治理记忆，不会创建副本。</p></div>
+    <div class="modal-head"><h3>编辑规则正文</h3><p>保存前检查版本和强制规则预算，保留修改记录。</p></div>
     <div class="modal-body"><label class="field"><span>正文</span><textarea id="neuron-rule-body-input" rows="8" maxlength="12000"></textarea></label></div>
     <div class="modal-actions"><button class="btn" type="button" data-mg-action="neuron-rule-body-close">取消</button><button class="btn btn-primary" type="button" data-mg-action="neuron-rule-body-save" data-memory-id="${escapeHtml(memoryId)}">保存</button></div>
   </div>`;
   document.body.appendChild(modal);
   const input = document.getElementById('neuron-rule-body-input');
-  if (input) input.value = String(node.body || '');
+  if (input) { input.value = String(node.canonical_text || node.body || ''); input.focus(); }
 }
 
 async function refreshNeuronRuleGovernance(memoryId, message = '') {
@@ -4270,10 +4274,15 @@ async function saveNeuronRuleBody(memoryId) {
   const body = String(document.getElementById('neuron-rule-body-input')?.value || '').trim();
   if (!body) return showToast('规则正文不能为空', 'error');
   try {
-    const result = await callApi('edit_memory', memoryId, body, activeShareGroupId || 'default');
+    const modal = document.getElementById('neuron-rule-body-modal');
+    const definitionId = modal?.dataset.definitionId;
+    const result = definitionId
+      ? await callApi('update_rule_body', definitionId, body, Number(modal.dataset.revision), activeShareGroupId || 'default')
+      : await callApi('edit_memory', memoryId, body, activeShareGroupId || 'default');
     if (result.error || result.ok === false) throw new Error(result.error || '更新失败');
     removeNeuronRuleBodyModal();
-    await refreshNeuronRuleGovernance(memoryId, result.message || '规则正文已更新');
+    if (state.activeTab === 'rules') { await renderRulesHabits(); showToast('规则正文已更新', 'success'); }
+    else await refreshNeuronRuleGovernance(memoryId, result.message || '规则正文已更新');
   } catch (error) { showToast(`规则正文更新失败：${error.message || error}`, 'error'); }
 }
 
@@ -8140,9 +8149,7 @@ function conflictActionDescriptors(conflict) {
   // API error instead of silently leaving an unusable disabled row.
   const status = String(conflict?.status || conflict?.source_status || '').trim().toLowerCase();
   const liveCount = optionalFiniteNumber(conflict?.live_member_count ?? conflict?.program_member_count);
-  const stale = ['stale', 'invalid', 'expired', 'unrecoverable'].includes(status)
-    || conflict?.can_resolve === false
-    || (Number.isFinite(liveCount) && liveCount < 2);
+  const stale = status !== 'ambiguous' && (['stale', 'invalid', 'expired', 'unrecoverable'].includes(status) || conflict?.can_resolve === false || (Number.isFinite(liveCount) && liveCount < 2));
   if (stale && !normalized.some(item => item.method === 'close_stale_conflict')) {
     normalized.push({method: 'close_stale_conflict', label: '关闭失效冲突', enabled: true, reason: '候选不足，保留历史审计记录并关闭该冲突'});
   }
@@ -9276,7 +9283,7 @@ function renderRulesRail() {
   const receipts = ruleReceiptsFor(record);
   const merged = Array.isArray(record.supersedes) ? record.supersedes : [];
   const sourceText = Array.isArray(record.sources) ? record.sources.join('、') : (record.source || record.origin || '未返回合并来源');
-  railTitle('规则详情', `<div class="rail-section"><div class="rail-title">${escapeHtml(displayTitle(record))}</div><span class="chip ${record.injection_policy === 'always' ? 'chip-confirmed' : 'chip-info'}">${record.injection_policy === 'always' ? '强制' : '按需'}</span></div><div class="rail-section"><h4>正文</h4><div class="rail-copy">${escapeHtml(displayBody(record) || '暂无正文内容')}</div></div><div class="rail-section"><h4>适用范围</h4><div class="rail-copy">${escapeHtml(ruleAudience(record))}</div></div><div class="rail-section"><h4>合并来源</h4><div class="rail-copy">${escapeHtml(merged.length ? `${merged.length} 条旧记忆` : sourceText)}</div></div><div class="rail-section"><h4>命中回执</h4>${receipts.length ? receipts.slice(-3).map(renderRuleReceiptActions).join('') : '<div class="rail-copy">暂无命中回执。</div>'}</div><div class="rail-section"><button class="btn btn-primary" type="button" data-mg-action="rule-edit" data-memory-id="${escapeHtml(record.memory_id)}">管理适用范围</button></div><details class="compact-secondary"><summary>技术详情</summary><div class="rail-copy">memory_id: ${escapeHtml(record.memory_id || '')}<br>分类: ${escapeHtml(record.kind || '')}</div></details>`);
+  railTitle('规则详情', `<div class="rail-section"><div class="rail-title">${escapeHtml(displayTitle(record))}</div><span class="chip ${record.injection_policy === 'always' ? 'chip-confirmed' : 'chip-info'}">${record.injection_policy === 'always' ? '强制' : '按需'}</span></div><div class="rail-section"><h4>正文</h4><div class="rail-copy">${escapeHtml(displayBody(record) || '暂无正文内容')}</div></div><div class="rail-section"><h4>适用范围</h4><div class="rail-copy">${escapeHtml(ruleAudience(record))}</div></div><div class="rail-section"><h4>合并来源</h4><div class="rail-copy">${escapeHtml(merged.length ? `${merged.length} 条旧记忆` : sourceText)}</div></div><div class="rail-section"><h4>命中回执</h4>${receipts.length ? receipts.slice(-3).map(renderRuleReceiptActions).join('') : '<div class="rail-copy">暂无命中回执。</div>'}</div><div class="rail-section"><button class="btn btn-primary" type="button" data-mg-action="rule-edit" data-memory-id="${escapeHtml(record.memory_id)}">管理适用范围</button><button class="btn" type="button" data-mg-action="neuron-rule-edit-body" data-memory-id="${escapeHtml(record.memory_id)}">编辑正文</button></div><details class="compact-secondary"><summary>技术详情</summary><div class="rail-copy">memory_id: ${escapeHtml(record.memory_id || '')}<br>分类: ${escapeHtml(record.kind || '')}</div></details>`);
 }
 
 function ruleTableRows(records) {

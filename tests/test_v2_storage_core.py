@@ -18,6 +18,33 @@ from memoryguard.storage.transaction import Transaction, TransactionError, trans
 from memoryguard.system.manifest import ManifestError, ManifestManager, ManifestState
 
 
+def test_snapshot_reads_uncheckpointed_wal_without_copying_live_shm(tmp_path, monkeypatch):
+    from memoryguard.storage import database
+
+    path = tmp_path / "live.db"
+    live = connect_database(path)
+    try:
+        live.execute("PRAGMA wal_autocheckpoint=0")
+        live.execute("CREATE TABLE sample(value TEXT)")
+        live.execute("INSERT INTO sample VALUES ('committed WAL value')")
+        live.commit()
+        before = {suffix: Path(str(path) + suffix).read_bytes() for suffix in ("", "-wal", "-shm")}
+        original_copy = database.shutil.copy2
+
+        def copy_with_windows_shm_lock(source, target):
+            if str(source).endswith("-shm"):
+                raise PermissionError("WinError 33: SQLite owns the shared-memory locks")
+            return original_copy(source, target)
+
+        monkeypatch.setattr(database.shutil, "copy2", copy_with_windows_shm_lock)
+        with database.open_database_snapshot(path) as snapshot:
+            assert snapshot.execute("SELECT value FROM sample").fetchone()[0] == "committed WAL value"
+        assert {suffix: Path(str(path) + suffix).read_bytes() for suffix in before} == before
+    finally:
+        live.close()
+        database.release_database_snapshots()
+
+
 def test_layout_paths_are_contained_and_exact(tmp_path: Path):
     layout = WorkspaceV2Layout(tmp_path)
     assert layout.runtime_db == tmp_path / ".memoryguard" / "runtime" / "runtime.db"

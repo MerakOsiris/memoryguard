@@ -768,7 +768,7 @@ class EvidenceProjectionError(RuntimeError):
 class RuleV2Store:
     """Transactional shadow store for V2 rule facts."""
 
-    def __init__(self, workspace: str | Path, *, read_only: bool = False):
+    def __init__(self, workspace: str | Path, *, read_only: bool = False, initialize: bool = True):
         self.workspace = Path(workspace).expanduser().resolve()
         self.layout = WorkspaceV2Layout(self.workspace)
         self.root = self.workspace / ".memoryguard" / "rules"
@@ -776,7 +776,7 @@ class RuleV2Store:
         self.read_only = bool(read_only)
         self._lock = WorkspaceGovernanceLock(self.workspace)
         self._state = threading.local()
-        if self.read_only:
+        if self.read_only or not initialize:
             if not self.db_path.is_file():
                 raise FileNotFoundError(f"rules database not found: {self.db_path}")
             self.layout.assert_database_path(self.db_path, "rules")

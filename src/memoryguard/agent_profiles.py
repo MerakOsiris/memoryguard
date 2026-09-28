@@ -1055,6 +1055,36 @@ def _grok_profile() -> AgentProfile:
     )
 
 
+def _workbuddy_profile() -> AgentProfile:
+    """WorkBuddy is already a mapped product. One home surface makes it detectable."""
+    surfaces = [
+        MemorySurface(
+            surface_id="workbuddy_home",
+            path_template="%HOME%/.workbuddy",
+            surface_role="control_surface",
+            scope="user",
+            load_order=20,
+            loader_evidence="local workbuddy home",
+            classification_confidence=0.70,
+            category=SourceCategory.CONTROL_SURFACE,
+            ingestion_policy=IngestionPolicy.GOVERN_ONLY,
+            ownership=Ownership.EXTERNAL_READ_ONLY,
+            target_role=TargetRole.NONE,
+        ),
+    ]
+    return AgentProfile(
+        profile_id="workbuddy@profile-1",
+        product="workbuddy",
+        profile_version="1",
+        supported_platforms=["windows", "macos", "linux"],
+        verified_product_versions=[],
+        detection_rules=[],
+        surfaces=surfaces,
+        target_capability=TargetCapability.EXPORT_ONLY,
+        evidence_urls=[],
+    )
+
+
 _BUILTIN_PROFILES: list[AgentProfile] = []
 
 
@@ -1092,6 +1122,7 @@ def _load_builtins() -> None:
         _openclaw_profile(),
         _qoder_profile(),
         _grok_profile(),
+        _workbuddy_profile(),
     ]]
 
 

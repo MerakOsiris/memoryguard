@@ -819,7 +819,12 @@ class AgentNativeService:
                 item["shared_surface_count"] = len(shared_surfaces)
                 agents.append(item)
                 continue
-            if private_surfaces and not install_surfaces:
+            program = str(item.get("canonical_program_id") or item.get("program_id") or "")
+            if program == "unknown":
+                program = ""
+            # A recognized install stays bindable. Residuals are data without
+            # a program identity; those endpoints remain explicit and unbound.
+            if private_surfaces and not install_surfaces and not program:
                 residual = self.residual_cleanup(instance_id=str(item["instance_id"]))
                 residual["found_surface_count"] = item["found_surface_count"]
                 residual["surface_count"] = item["surface_count"]

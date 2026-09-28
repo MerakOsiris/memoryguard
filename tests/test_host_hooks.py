@@ -236,7 +236,15 @@ def _seed_v2_rule_receipt(
 
 
 @pytest.fixture(autouse=True)
-def _pure_v2_host_seam(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+def _pure_v2_host_seam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+):
+    fixture_home = tmp_path / "host-seam-home"
+    fixture_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fixture_home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     if request.node.name in {
         "test_binding_plane_retires_v1_workspace_without_legacy_fallback",
         "test_binding_validation_never_falls_back_to_legacy_in_v2",
@@ -1713,14 +1721,20 @@ def test_pre_tool_real_bootstrap_request_bypasses_legacy_failure_state(
         (
             "codex",
             "mcp__memoryguard__memoryguard_memory_update",
-            {"memory_id": "duplicate-rule", "injection_policy": "relevant"},
+            {
+                "memory_id": "duplicate-rule",
+                "preview": True,
+                "expected_revision": 1,
+                "idempotency_key": "preview-budget",
+                "reason": "check budget",
+            },
         ),
         (
             "cursor",
             "CallMcpTool",
             {
                 "serverName": "memoryguard",
-                "toolName": "memoryguard_memory_delete",
+                "toolName": "memoryguard_memory_read",
                 "arguments": {"memory_id": "duplicate-rule"},
             },
         ),
@@ -1735,6 +1749,13 @@ def test_recovery_tools_bypass_broken_context_pretool_gate(
 ):
     workspace = tmp_path / "control"
     workspace.mkdir()
+    host_hooks._save_state(workspace, provider, "repair-session", {
+        "bootstrap_ok": False,
+        "bootstrap_error": "mandatory_budget_exceeded",
+        "mandatory_overflow": True,
+        "mandatory_invalid_reason": "mandatory_budget_exceeded",
+        "context_hash": "",
+    })
 
     def fail_if_bootstrap_runs(_workspace):
         raise AssertionError("recovery PreToolUse must not enter broken V2 bootstrap")
@@ -1757,6 +1778,50 @@ def test_recovery_tools_bypass_broken_context_pretool_gate(
         },
     )
     assert result == {}
+    state = host_hooks._load_state(workspace, provider, "repair-session")
+    assert state["mandatory_overflow"] is True
+    assert state["bootstrap_ok"] is False
+
+
+def test_overflow_blocks_committing_update_and_names_recovery_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    host_hooks._save_state(workspace, "codex", "repair-session", {
+        "bootstrap_ok": False,
+        "bootstrap_error": "mandatory_budget_exceeded",
+        "mandatory_overflow": True,
+        "mandatory_invalid_reason": "mandatory_budget_exceeded",
+        "context_hash": "",
+    })
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: (_ for _ in ()).throw(AssertionError("ordinary tools must not enter V2")),
+    )
+    denied = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": "repair-session",
+            "tool_name": "mcp__memoryguard__memoryguard_memory_update",
+            "tool_input": {"memory_id": "duplicate-rule", "body": "commit"},
+        },
+    )
+    reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "普通任务工具已阻断" in reason
+    assert "memoryguard_context_bootstrap" in reason
+    assert "preview=true" in reason
+    assert "停止继续执行" not in reason
+    state = host_hooks._load_state(workspace, "codex", "repair-session")
+    assert state["mandatory_overflow"] is True
+    assert state["bootstrap_ok"] is False
 
 
 def test_stop_fails_open_when_v2_reports_mandatory_budget_exceeded(
@@ -3069,6 +3134,44 @@ def test_successful_bootstrap_post_tool_clears_recovery_claim(
     assert state["context_hash"]
     assert state["bootstrap_retry_claimed"] is False
     assert state["bootstrap_retry_claimed_at"] == 0
+
+
+@pytest.mark.parametrize("result_kind", ["valid", "blocked", "foreign_agent", "bare_success"])
+def test_verified_bootstrap_post_tool_recovers_mandatory_overflow(tmp_path, result_kind):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    session_id = "mandatory-post-tool-recovery"
+    host_hooks._save_state(workspace, "codex", session_id, {
+        "bootstrap_ok": False, "bootstrap_error": "mandatory_budget_exceeded",
+        "mandatory_overflow": True, "mandatory_invalid_reason": "mandatory_budget_exceeded",
+        "context_hash": "", "mandatory_rule_ids": ["stale-rule"],
+    })
+    packet = {"status": "ok", "error": "", "state": "V2_ACTIVE", "ready": True,
+              "effective_agent": "codex-agent", "mandatory": [], "relevant": [],
+              "receipts": [], "budget": {"mandatory": {"items": 0, "chars": 0, "tokens": 0}}}
+    if result_kind == "blocked":
+        packet.update(status="blocked", error="mandatory_budget_exceeded")
+    elif result_kind == "foreign_agent":
+        packet["effective_agent"] = "other-agent"
+    envelope = {"ok": True, "name": "memoryguard_context_bootstrap", "data": packet}
+    if result_kind == "bare_success":
+        envelope = {"ok": True}
+    run_hook(provider="codex", event="post_tool", workspace=workspace,
+             agent_instance_id="codex-agent", share_group_id="group-a", payload={
+                 "session_id": session_id,
+                 "tool_name": "mcp__memoryguard__memoryguard_context_bootstrap", "tool_input": {"task": "repair"},
+                 "tool_result": {"isError": False, "content": [{"type": "text", "text": json.dumps(envelope)}]},
+             })
+    state = host_hooks._load_state(workspace, "codex", session_id)
+    if result_kind == "valid":
+        assert state["bootstrap_ok"] is True
+        assert state["mandatory_overflow"] is False
+        assert state["mandatory_invalid_reason"] == ""
+        assert state["mandatory_rule_ids"] == []
+        assert state["context_hash"]
+    else:
+        assert state["bootstrap_ok"] is False
+        assert state["mandatory_overflow"] is True
 
 
 def test_subagent_start_receives_bounded_governance_context(

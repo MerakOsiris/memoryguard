@@ -367,7 +367,9 @@ def test_diagnostics_stay_open_and_high_risk_write_stays_closed_on_overflow(tmp_
         share_group_id=group,
         payload={**payload, "prompt": "implement feature"},
     )
-    assert "强制规则包异常，停止继续执行" in prompt["hookSpecificOutput"]["additionalContext"]
+    assert "普通任务工具已阻断" in prompt["hookSpecificOutput"]["additionalContext"]
+    assert "memoryguard_context_bootstrap" in prompt["hookSpecificOutput"]["additionalContext"]
+    assert "停止继续执行" not in prompt["hookSpecificOutput"]["additionalContext"]
 
     diagnostic = run_hook(
         provider="codex",

@@ -924,7 +924,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:
         lines.append(f"  error ({e})")
 
-    # 9. pywebview（可选）
+    # 9. 运行时租约（split brain）
+    #    升级后旧进程不退出会让写入被全面拒绝，而症状只表现为工具被挡，
+    #    所以 doctor 必须能独立报出来，不能只在 MCP 返回值里可见。
+    try:
+        from .runtime_lease import runtime_lease_status, describe_split_brain
+
+        lease = runtime_lease_status(workspace)
+        described = describe_split_brain(lease, control_workspace=workspace)
+        if described["split_brain"]:
+            lines.append("Runtime lease: [error] split brain")
+            lines.extend(described["detail_lines"])
+            lines.append(f"  修复: {described['remedy']}")
+            issues += 1
+        else:
+            live = len(lease.get("live") or [])
+            stale = len(lease.get("stale") or [])
+            suffix = f", {stale} stale" if stale else ""
+            lines.append(f"Runtime lease: [ok] ({live} live{suffix})")
+    except Exception as e:
+        lines.append(f"Runtime lease: error ({e})")
+
+    # 10. pywebview（可选）
     try:
         import webview  # type: ignore  # noqa: F401
         lines.append("GUI (pywebview): available [ok]")
@@ -941,6 +962,145 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     print("\n".join(lines))
     return 0 if issues == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# runtime (split-brain 诊断与显式回收)
+# ---------------------------------------------------------------------------
+
+
+def _runtime_lease_report(workspace) -> tuple[dict, dict]:
+    from .runtime_lease import runtime_lease_status, describe_split_brain
+
+    status = runtime_lease_status(workspace)
+    return status, describe_split_brain(status, control_workspace=workspace)
+
+
+def cmd_runtime_status(args: argparse.Namespace) -> int:
+    """只读查看运行时租约与 split brain 状态。"""
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
+    status, described = _runtime_lease_report(workspace)
+
+    print("MemoryGuard Runtime Lease")
+    print("=========================")
+    print(f"workspace: {workspace}")
+    print(f"leases:    {status.get('leases_path', '?')}")
+    for lease in status.get("live") or []:
+        print(
+            "  live  pid={pid} version={ver} started={started}".format(
+                pid=lease.get("pid"),
+                ver=lease.get("memoryguard_version", "?"),
+                started=lease.get("process_started_at", "?"),
+            )
+        )
+    for lease in status.get("stale") or []:
+        print(f"  stale pid={lease.get('pid')} (进程已退出，条目可被自动清理)")
+
+    if not described["split_brain"]:
+        print("\nsplit brain: no")
+        return 0
+
+    print("\nsplit brain: YES")
+    print(described["summary"])
+    print("\n冲突进程:")
+    for line in described["detail_lines"]:
+        print(line)
+    print(f"\n修复: {described['remedy']}")
+    return 1
+
+
+def cmd_runtime_reap(args: argparse.Namespace) -> int:
+    """结束以不同构建持有本 workspace 的残留进程。
+
+    仅在用户显式调用时执行，且逐个核对进程身份；MemoryGuard 自身在任何
+    自动路径上都不会终止进程。
+    """
+    import os
+    import signal
+    import time
+
+    from .runtime_lease import _process_started_at_for_pid, release_runtime_lease
+
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
+    _status, described = _runtime_lease_report(workspace)
+
+    if not described["split_brain"]:
+        print("没有检测到 split brain，无需回收。")
+        return 0
+
+    print(described["summary"])
+    print("\n将要结束以下进程:")
+    for line in described["detail_lines"]:
+        print(line)
+
+    if not getattr(args, "yes", False):
+        try:
+            answer = input("\n确认结束这些进程？只有你确认这些不是正在使用的窗口时才继续 [y/N]: ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("已取消，未终止任何进程。")
+            return 1
+
+    me = os.getpid()
+    killed, skipped = 0, 0
+    for lease in _status.get("conflicting") or []:
+        try:
+            pid = int(lease.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        if pid == me:
+            continue
+
+        # PID 会被系统复用。租约里记的启动时间和当前同号进程对不上时，
+        # 说明这个号已经属于别的程序，绝不能杀。
+        recorded = str(lease.get("process_started_at", "") or "")
+        observed = _process_started_at_for_pid(pid)
+        observed_iso = observed.isoformat() if observed is not None else ""
+        if observed_iso and recorded and observed_iso[:19] != recorded[:19]:
+            print(f"  pid={pid} 跳过：启动时间不匹配，PID 可能已被复用")
+            skipped += 1
+            continue
+        if observed is None:
+            print(f"  pid={pid} 已不在运行，仅清理租约条目")
+            release_runtime_lease(workspace, pid)
+            continue
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            release_runtime_lease(workspace, pid)
+            continue
+        except PermissionError:
+            print(f"  pid={pid} 跳过：权限不足")
+            skipped += 1
+            continue
+
+        for _ in range(20):
+            time.sleep(0.25)
+            if _process_started_at_for_pid(pid) is None:
+                break
+        else:
+            if hasattr(signal, "SIGKILL"):
+                try:
+                    os.kill(pid, signal.SIGKILL)  # type: ignore[attr-defined]
+                except OSError:
+                    pass
+
+        if _process_started_at_for_pid(pid) is None:
+            release_runtime_lease(workspace, pid)
+            print(f"  pid={pid} 已结束")
+            killed += 1
+        else:
+            print(f"  pid={pid} 未能结束")
+            skipped += 1
+
+    print(f"\n已结束 {killed} 个，跳过 {skipped} 个。")
+    if skipped:
+        print("仍有冲突进程存在，重启宿主前请先手动处理。")
+        return 1
+    print("现在重启宿主（Cursor / Codex 等）即可恢复。")
+    return 0
 
 
 def cmd_mcp_status(args: argparse.Namespace) -> int:
@@ -1401,6 +1561,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.add_argument("-w", "--workspace", default=".", help="workspace path")
     p_doctor.set_defaults(func=cmd_doctor)
 
+    p_runtime = sub.add_parser(
+        "runtime", help="inspect runtime leases and reap stale split-brain processes"
+    )
+    runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
+    p_runtime_status = runtime_sub.add_parser("status", help="read-only lease / split-brain status")
+    p_runtime_status.add_argument("-w", "--workspace", default=".", help="workspace path")
+    p_runtime_status.set_defaults(func=cmd_runtime_status)
+    p_runtime_reap = runtime_sub.add_parser(
+        "reap", help="terminate processes holding this workspace with a different build"
+    )
+    p_runtime_reap.add_argument("-w", "--workspace", default=".", help="workspace path")
+    p_runtime_reap.add_argument(
+        "--yes", action="store_true", help="skip the confirmation prompt"
+    )
+    p_runtime_reap.set_defaults(func=cmd_runtime_reap)
+
     p_mcp_status = sub.add_parser("mcp-status", help="query MCP memory backend status")
     p_mcp_status.add_argument("-w", "--workspace", default=".", help="workspace path")
     p_mcp_status.set_defaults(func=cmd_mcp_status)
@@ -1724,7 +1900,7 @@ def _cli_workspace(args: argparse.Namespace) -> Path:
     # commands (audit/scan/open/...) intentionally retain bounded cwd lookup.
     control_commands = {
         "doctor", "mcp-status", "hooks", "provider", "groups", "desktop", "open",
-        "gc", "storage", "source", "import",
+        "gc", "storage", "source", "import", "runtime",
     }
     if command in control_commands:
         from .data_home import resolve_runtime_data_home
@@ -1870,7 +2046,7 @@ def _dispatch_cutover(args: argparse.Namespace) -> int:
         if host_action:
             break
         cursor = cursor.get("data")
-    allowed_host_actions = {"source", "provider", "hooks", "gui", "open", "desktop"}
+    allowed_host_actions = {"source", "provider", "hooks", "gui", "open", "desktop", "runtime"}
     if result.get("ok") and host_action:
         if host_action != str(getattr(args, "command", "")) or host_action not in allowed_host_actions:
             result = {
@@ -1895,6 +2071,37 @@ def _dispatch_cutover(args: argparse.Namespace) -> int:
         "v2_context_capability_required",
         "v2_operation_retired",
     } else 1
+
+
+def _warn_split_brain_after_upgrade(upgrade_argv: list[str]) -> None:
+    """升级后提示仍在运行的旧构建进程。
+
+    新代码已经落盘，但常驻的旧进程还持有同一个 workspace，下一次写入就会被
+    拒绝。这里只报告并给出命令，不代替用户终止任何进程。
+    """
+    try:
+        workspace = None
+        if "--workspace" in upgrade_argv:
+            workspace = upgrade_argv[upgrade_argv.index("--workspace") + 1]
+        if not workspace:
+            from .data_home import resolve_runtime_data_home
+
+            workspace = str(resolve_runtime_data_home().expanduser().resolve())
+
+        from .runtime_lease import split_brain_hint
+
+        hint = split_brain_hint(workspace)
+        if not hint.get("split_brain"):
+            return
+        print("")
+        print("!! 升级已完成，但检测到仍在运行的旧构建进程：")
+        for line in hint["detail_lines"]:
+            print(line)
+        print("   在它们退出前，所有写入都会被拒绝。")
+        print(f"   处理：{hint['remedy']}，然后重启宿主。")
+    except Exception:
+        # 提示失败绝不能影响升级本身的返回码
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1943,7 +2150,10 @@ def main(argv: list[str] | None = None) -> int:
             upgrade_argv.extend(["--apply", "--confirm", "V2_ACTIVE"])
         elif not requested.preview and requested.confirm is not None and not requested.apply:
             upgrade_argv.append("--apply")
-        return upgrade_main(upgrade_argv)
+        rc = upgrade_main(upgrade_argv)
+        if not requested.preview:
+            _warn_split_brain_after_upgrade(upgrade_argv)
+        return rc
     parser = build_parser()
     args = parser.parse_args(argv)
     return _dispatch_cutover(args)

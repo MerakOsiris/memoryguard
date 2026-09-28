@@ -585,7 +585,7 @@ def open_localhost_window(
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     url = f"http://127.0.0.1:{port}/"
-    print(f"MemoryGuard GUI running at {url} (sandbox={is_sandbox})")
+    print(f"MemoryGuard GUI running at {url} (sandbox={is_sandbox})", flush=True)
     if native_webview:
         if not has_native_gui():
             server.server_close()
@@ -810,6 +810,7 @@ def _redact_gui_source_result(
 
 
 _GUI_DIRECT_PARAMETER_NAMES: dict[str, tuple[str, ...]] = {
+    "update_rule_body": ("definition_id", "body", "expected_revision", "share_group_id"),
     "search_memory": ("query", "share_group_id", "semantic", "limit"),
     "edit_memory": ("memory_id", "body", "share_group_id"),
     "lock_memory": ("memory_id", "share_group_id"),

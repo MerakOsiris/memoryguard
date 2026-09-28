@@ -529,8 +529,8 @@ def test_registry_is_complete_and_digest_is_stable(tmp_path):
     # Phase-11 acceptance requires every canonical GUI operation to resolve to
     # a native handler. A missing handler is a blocker, never a retired success.
     # Keep these counts aligned with canonical GUI registry expansion.
-    assert coverage["surfaces"]["gui"]["total"] == 170
-    assert coverage["surfaces"]["gui"]["implemented"] == 170
+    assert coverage["surfaces"]["gui"]["total"] == 171
+    assert coverage["surfaces"]["gui"]["implemented"] == 171
     assert coverage["surfaces"]["gui"]["blocker"] == 0
     gui_by_name = {
         item["name"]: item for item in coverage["surfaces"]["gui"]["entries"]
@@ -911,6 +911,222 @@ def test_native_memory_mutation_blocks_future_and_partial_schema(tmp_path):
         generation=1,
     )
     assert partial["code"] == "v2_schema_partial"
+
+
+def test_memory_policy_update_and_legacy_outbox_retry_preserve_evidence_identity(tmp_path: Path):
+    """Mutable policy changes reuse source evidence; old failed rows remain retryable."""
+    from memoryguard.evidence import EvidenceStore
+    from memoryguard.governance_v2 import GovernanceV2
+    from memoryguard.memory.store import MemoryAtomStore
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    memory = MemoryAtomStore(tmp_path)
+    evidence = EvidenceStore(tmp_path)
+    GovernanceV2(tmp_path)
+    native = NativeV2RuntimePort(tmp_path, state_provider=Manifest())
+    facade = V2RuntimeFacade(manifest=Manifest(), v2=native, workspace=str(tmp_path))
+    context = _trusted_native_context(tmp_path)
+
+    created = facade.dispatch_mcp(
+        "memoryguard_memory_write",
+        {
+            "memory_id": "always-rule",
+            "body": "Use the configured model for memory rules.",
+            "kind": "procedure",
+            "status": "active",
+            "injection_policy": "always",
+            "priority": 10,
+            "visibility": "active",
+            "idempotency_key": "create-always-rule",
+        },
+        context=context,
+    )
+    assert created["ok"] is True, created
+    initial_read = facade.dispatch_mcp(
+        "memoryguard_memory_read", {"memory_id": "always-rule"}, context=context,
+    )
+    assert initial_read["ok"] is True
+    atom_id = initial_read["data"]["atom_id"]
+    evidence_ids = memory.evidence_ids_for_atom(atom_id)
+    assert len(evidence_ids) == 1
+    evidence_id = evidence_ids[0]
+    original_evidence = evidence._get_evidence_unscoped(evidence_id).to_dict()
+
+    # Same body and source identity, but a changed mutable setting used to
+    # reuse the evidence_id while changing its immutable metadata.
+    policy_update = {
+        "memory_id": "always-rule",
+        "injection_policy": "relevant",
+        "idempotency_key": "same-policy-retry",
+    }
+    changed = facade.dispatch_mcp(
+        "memoryguard_memory_update", policy_update, context=context,
+    )
+    assert changed["ok"] is True, changed
+    after_policy_read = facade.dispatch_mcp(
+        "memoryguard_memory_read", {"memory_id": "always-rule"}, context=context,
+    )
+    assert after_policy_read["ok"] is True
+    assert after_policy_read["data"]["injection_policy"] == "relevant"
+    assert after_policy_read["data"]["priority"] == 10
+    assert after_policy_read["data"]["visibility"] == "active"
+    assert set(memory.evidence_ids_for_atom(atom_id)) == {evidence_id}
+    assert evidence._get_evidence_unscoped(evidence_id).to_dict() == original_evidence
+
+    # Model a failed pre-fix event: the same automatically-derived ID and
+    # source evidence, with only its legacy injection_policy metadata changed.
+    legacy_payload = dict(original_evidence)
+    legacy_payload.pop("evidence_id", None)
+    legacy_payload["metadata"] = {
+        **dict(original_evidence["metadata"]),
+        "injection_policy": "always",
+    }
+    legacy_event_id = memory.queue_evidence(
+        legacy_payload,
+        subject_type="atom",
+        subject_id=atom_id,
+        relation="supports",
+        aggregate_id=atom_id,
+    )
+    # Also cover an old automatic row whose immutable metadata already stored
+    # the previous policy: retrying it with the new policy must preserve it.
+    historical = {
+        "source_ref": "fixture:historical-policy",
+        "digest": "historical-policy-digest",
+        "authority": "observed",
+        "status": "valid",
+        "metadata": {
+            "source_event_id": "historical-event",
+            "agent_instance_id": "agent-bound",
+            "share_group_id": "group-bound",
+            "kind": "procedure",
+            "classification_override": None,
+            "injection_policy": "always",
+        },
+        "subject_type": "atom",
+        "subject_id": atom_id,
+    }
+    evidence.project_batch([{
+        "event_id": "seed-historical-policy-evidence",
+        "aggregate_id": atom_id,
+        "payload": historical,
+    }])
+    historical_evidence_id = evidence._coerce_evidence(historical).evidence_id
+    historical_row = evidence._get_evidence_unscoped(historical_evidence_id).to_dict()
+    historical_candidate = dict(historical)
+    historical_candidate.pop("evidence_id", None)
+    historical_candidate["metadata"] = {
+        **historical["metadata"],
+        "injection_policy": "relevant",
+    }
+    historical_failed_event_id = memory.queue_evidence(
+        historical_candidate,
+        subject_type="atom",
+        subject_id=atom_id,
+        relation="supports",
+        aggregate_id=atom_id,
+    )
+    with sqlite3.connect(memory.db_path) as conn:
+        conn.execute(
+            "UPDATE domain_outbox SET status='failed', error_json=?, attempts=1 WHERE event_id=?",
+            (json.dumps({"type": "ValueError", "message": "evidence_id conflict: synthetic"}), legacy_event_id),
+        )
+        conn.execute(
+            "UPDATE domain_outbox SET status='failed', error_json=?, attempts=1 WHERE event_id=?",
+            (json.dumps({"type": "ValueError", "message": "evidence_id conflict: synthetic"}), historical_failed_event_id),
+        )
+
+    # An unrelated real MCP write retries the old failed event in the normal
+    # batch projector, then publishes its own new evidence in that same batch.
+    unrelated = facade.dispatch_mcp(
+        "memoryguard_memory_write",
+        {
+            "memory_id": "unrelated-rule",
+            "body": "Keep independent rules in their own records.",
+            "kind": "procedure",
+            "status": "active",
+            "injection_policy": "relevant",
+            "priority": 1,
+            "visibility": "active",
+            "idempotency_key": "create-unrelated-rule",
+        },
+        context=context,
+    )
+    assert unrelated["ok"] is True, unrelated
+    assert memory.pending_outbox(include_failed=True) == []
+    assert evidence._get_evidence_unscoped(historical_evidence_id).to_dict() == historical_row
+    unrelated_read = facade.dispatch_mcp(
+        "memoryguard_memory_read", {"memory_id": "unrelated-rule"}, context=context,
+    )
+    assert unrelated_read["ok"] is True
+    assert unrelated_read["data"]["body"] == "Keep independent rules in their own records."
+
+    # A same-key repeat is idempotent and leaves the projected row untouched.
+    revision = after_policy_read["data"]["revision"]
+    replay = facade.dispatch_mcp(
+        "memoryguard_memory_update", policy_update, context=context,
+    )
+    assert replay["ok"] is True, replay
+    final_read = facade.dispatch_mcp(
+        "memoryguard_memory_read", {"memory_id": "always-rule"}, context=context,
+    )
+    assert final_read["ok"] is True
+    assert final_read["data"]["revision"] == revision
+    assert final_read["data"]["injection_policy"] == "relevant"
+    assert evidence._get_evidence_unscoped(evidence_id).to_dict() == original_evidence
+    assert memory.pending_outbox(include_failed=True) == []
+
+    # Compatibility is narrow: explicit IDs, trusted-scope changes, evidence
+    # status changes, and malformed legacy policy values still conflict.
+    def assert_projection_conflict(label: str, candidate: dict[str, object]) -> None:
+        candidate.update({"subject_type": "atom", "subject_id": atom_id})
+        event = {"event_id": "strict-" + label, "aggregate_id": atom_id, "payload": candidate}
+        with pytest.raises(ValueError, match="evidence_id conflict:"):
+            evidence.project_batch([event])
+
+    explicit_policy_change = dict(original_evidence)
+    explicit_policy_change["metadata"] = {**dict(original_evidence["metadata"]), "injection_policy": "relevant"}
+    assert_projection_conflict("explicit-id", explicit_policy_change)
+
+    wrong_scope = dict(original_evidence)
+    wrong_scope.pop("evidence_id", None)
+    wrong_scope["metadata"] = {**dict(original_evidence["metadata"]), "share_group_id": "other-scope"}
+    assert_projection_conflict("scope", wrong_scope)
+
+    wrong_status = dict(original_evidence)
+    wrong_status.pop("evidence_id", None)
+    wrong_status["status"] = "stale"
+    assert_projection_conflict("status", wrong_status)
+
+    invalid_legacy_policy = dict(original_evidence)
+    invalid_legacy_policy.pop("evidence_id", None)
+    invalid_legacy_policy["metadata"] = {
+        **dict(original_evidence["metadata"]),
+        "injection_policy": {"unexpected": "value"},
+    }
+    assert_projection_conflict("invalid-policy", invalid_legacy_policy)
+
+    whitespace_id_evidence = {
+        "evidence_id": " ",
+        "source_ref": "fixture:whitespace-id",
+        "digest": "whitespace-id-digest",
+        "authority": "observed",
+        "status": "valid",
+        "metadata": {"injection_policy": "always"},
+        "subject_type": "atom",
+        "subject_id": atom_id,
+    }
+    evidence.project_batch([{
+        "event_id": "strict-whitespace-create",
+        "aggregate_id": atom_id,
+        "payload": whitespace_id_evidence,
+    }])
+    whitespace_id_conflict = dict(whitespace_id_evidence)
+    whitespace_id_conflict["metadata"] = {"injection_policy": "relevant"}
+    assert_projection_conflict("whitespace-explicit-id", whitespace_id_conflict)
 
 
 def test_native_memory_governance_receipt_replays_across_restart_and_conflicts_on_body(tmp_path):

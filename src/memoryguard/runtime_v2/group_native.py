@@ -318,6 +318,17 @@ class GroupControlService:
                 record = self.provider_identity(provider)
                 if record:
                     registry[provider.casefold()] = record
+            from ..provider_adapters import configured_provider_agent_ids
+            configured = configured_provider_agent_ids()
+            for provider, endpoint_ids in configured.items():
+                if provider in registry or len(endpoint_ids) != 1:
+                    continue
+                registry[provider] = {
+                    "canonical_id": next(iter(endpoint_ids)),
+                    "aliases": [],
+                    "share_group_id": "",
+                    "identity_source": "provider_configuration",
+                }
             for provider, record in registry.items():
                 identity = normalize_program_identity(provider)
                 if identity["program_id"] == "unknown":
@@ -336,7 +347,7 @@ class GroupControlService:
                         "canonical_agent_instance_id": canonical,
                         "provider_identity_provider": provider,
                         "provider_identity_group_id": str(record.get("share_group_id") or ""),
-                        "identity_source": "provider_identity_registry",
+                        "identity_source": str(record.get("identity_source") or "provider_identity_registry"),
                         "resolution": "canonical" if is_canonical else "alias",
                         "member_status": "historical_missing",
                         "identity_role": "canonical" if is_canonical else "alias",
@@ -1865,8 +1876,11 @@ class GroupControlService:
         from ..provider_adapters import get_provider_adapter_class
         instances, _ = AgentLocator(self.workspace).detect_instances()
         product_by_id = {str(item.instance_id): str(item.product) for item in instances}
+        catalog = self.identity_catalog()
+        product_by_id.update({key: str(value.get("program_id") or "") for key, value in catalog.items()})
         installed: list[dict[str, Any]] = []
         newly_configured: list[Any] = []
+        installed_programs: set[str] = set()
         failure = False
         for binding in bindings:
             agent_id = binding["agent_instance_id"]
@@ -1875,6 +1889,13 @@ class GroupControlService:
             if adapter_cls is None:
                 installed.append({"agent_instance_id": agent_id, "product": product, "status": "skipped", "skipped": True, "reason": "automatic_install_adapter_not_implemented"})
                 continue
+            if product in installed_programs:
+                continue
+            canonical = self.active_binding_for_agent(agent_id, identity_catalog=catalog)
+            if canonical is None or str(canonical.get("share_group_id") or "") != group:
+                raise GroupControlError("provider_identity_group_mismatch")
+            agent_id = str(canonical["agent_instance_id"])
+            installed_programs.add(product)
             adapter = adapter_cls(self.workspace)
             try:
                 before = adapter.status()

@@ -34,7 +34,7 @@ from .agent_profiles import AgentProfileRegistry, detect_surface
 from .agent_mapping import (
     AGENT_PRODUCT_MAP, IGNORED_DIRS,
     product_for_dot_dir, is_known_product, detect_stale_status,
-    provider_display_name,
+    provider_display_name, candidate_visible,
 )
 from .schema_v3 import (
     AgentInstance, AgentProfile, DiscoveryEntry, DiscoveryLedger,
@@ -318,6 +318,8 @@ class AgentLocator:
                 continue
 
             product = product_for_dot_dir(entry.name) or "unknown"
+            if not candidate_visible(entry.name, product, entry):
+                continue
             if product == "unknown" and not include_unknown:
                 continue
 

@@ -149,7 +149,7 @@ def _instruction_body(share_group_id: str = "default") -> str:
 - 每个新任务优先调用一次 `memoryguard_context_bootstrap`，传入当前 `task`；同一任务不得重复调用
 - Claude/Codex Hook 已提供本轮 bootstrap 上下文时不要重复调用；Cursor 以 Hook 的首次工具门控为准
 - bootstrap 只补充长期记忆/长期规则；宿主当前对话上下文保持原样，不替换、不重复注入
-- bootstrap 先注入独立预算的强制规则包，再召回相关记忆；强制包敏感或超限会失败封闭，停止继续执行。
+- bootstrap 先注入独立预算的强制规则包，再召回相关记忆；强制包敏感或超限会失败封闭，只阻断普通任务工具。诊断、读取、memoryguard_memory_update 的 preview=true，以及 memoryguard_context_bootstrap 仍可用。普通工具要等受控治理完成且真实 bootstrap 成功后才解除。
 - 仅在 bootstrap 后仍需精确治理查询时调用 `memoryguard_memory_search`
 - 历史对话文件只是可选来源，必须先萃取为长期记忆；禁止把历史对话全文注入当前任务
 - 需要精确原文时再用 `memoryguard_memory_read` 读取命中的单条记录
@@ -386,7 +386,9 @@ def _snapshot_python_if_ready(snapshot_root: Path | None) -> str:
 def _run_snapshot_command(argv: list[str]) -> None:
     import subprocess
 
-    completed = subprocess.run(argv, check=False, capture_output=True, text=True)
+    # Build tools can emit a mix of UTF-8 and the Windows locale. Output is
+    # diagnostic-only here; byte capture avoids reader-thread decode failures.
+    completed = subprocess.run(argv, check=False, capture_output=True)
     if int(completed.returncode or 0) != 0:
         raise RuntimeError("editable_install_snapshot_failed")
 
@@ -890,7 +892,7 @@ def _codex_managed_mcp_state(text: str) -> tuple[str, str]:
         server = ((data.get("mcp_servers") or {}).get(MCP_SERVER_NAME) or {})
         env = server.get("env") or {} if isinstance(server, dict) else {}
         agent_id = (
-            str(env.get("MEMORYGUARD_AGENT_ID") or "").strip()
+            accepted_config_agent_id(env, "codex")
             if isinstance(env, dict)
             else ""
         )
@@ -1048,6 +1050,19 @@ def _reconcile_memoryguard_toml_tables(text: str) -> str:
         )
         index = end
     return "".join(result)
+
+
+def _upsert_memoryguard_toml(text: str, section: str) -> str:
+    # Codex's trust writer can place hook-state tables before our end marker.
+    # If the valid MCP table already matches, preserve those bytes and order.
+    try:
+        current = tomllib.loads(text).get("mcp_servers", {}).get(MCP_SERVER_NAME)
+        expected = tomllib.loads(section)["mcp_servers"][MCP_SERVER_NAME]
+        if current == expected and text.count(_TOML_BEGIN) == text.count(_TOML_END) == 1:
+            return text
+    except (ValueError, KeyError, TypeError):
+        pass
+    return _replace_section(_reconcile_memoryguard_toml_tables(text), _TOML_BEGIN, _TOML_END, section)
 
 
 def _remove_section(text: str, begin_marker: str, end_marker: str) -> str:
@@ -1339,6 +1354,9 @@ class ProviderAdapter:
         """安装前先验证真实身份和授权，禁止生成不可用的匿名 MCP 配置。"""
         if not agent_instance_id:
             raise ValueError("agent_instance_id is required for MCP installation")
+        owner = foreign_hook_owner(agent_instance_id, self.provider_name)
+        if owner:
+            raise ValueError(f"provider_identity_conflict: {owner}")
         binding_id, binding_status = self._find_binding(
             agent_instance_id, share_group_id
         )
@@ -1555,13 +1573,8 @@ class ClaudeAdapter(ProviderAdapter):
         data = _load_json(mcp_path)
         mcp_configured = _has_mcp_server(data, MCP_SERVER_NAME)
 
-        agent_id = str(
-            data.get("mcpServers", {})
-            .get(MCP_SERVER_NAME, {})
-            .get("env", {})
-            .get("MEMORYGUARD_AGENT_ID", "")
-            or ""
-        )
+        hook_path = (self.workspace / ".claude" if self._has_workspace else self._config_dir()) / "settings.json"
+        agent_id = _mcp_env_agent_id(data, self.provider_name, hook_path)
         binding_id, binding_status = self._find_binding(agent_id)
         configured = instruction_installed and mcp_configured and bool(agent_id)
         return {
@@ -1638,12 +1651,11 @@ class CodexAdapter(ProviderAdapter):
 
         mcp_path = self._mcp_config_path()
         toml_content = _read_text_for_update(mcp_path)
-        toml_content = _reconcile_memoryguard_toml_tables(toml_content)
         section = _mcp_toml_section(
             agent_instance_id, self.workspace, control_scope=control_scope,
             runtime_python=runtime_python,
         )
-        new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
+        new_toml = _upsert_memoryguard_toml(toml_content, section)
         _validate_toml(new_toml, mcp_path)
         _backup_toml_before_repair(mcp_path, toml_content, new_toml)
         _apply_file_transaction([
@@ -1757,6 +1769,7 @@ class CodexAdapter(ProviderAdapter):
         toml_content = _read_text(mcp_path)
         block_state, agent_id = _codex_managed_mcp_state(toml_content)
         mcp_configured = block_state == "valid"
+        identity_home = mcp_path.parent
         if not mcp_configured:
             agent_id = ""
 
@@ -1772,6 +1785,7 @@ class CodexAdapter(ProviderAdapter):
                 if global_state == "valid":
                     mcp_configured = True
                     agent_id = global_agent_id
+                    identity_home = global_home
                     global_instr = global_home / "AGENTS.md"
                     global_text = _read_text(global_instr)
                     global_instruction = (
@@ -1783,6 +1797,10 @@ class CodexAdapter(ProviderAdapter):
                         instruction_installed or global_instruction
                     )
 
+        hook_ids = _hook_agent_ids(identity_home / "hooks.json", "codex")
+        if hook_ids and agent_id not in hook_ids:
+            agent_id = ""
+            mcp_configured = False
         binding_id, binding_status = self._find_binding(agent_id)
         configured = instruction_installed and mcp_configured and bool(agent_id)
         return {
@@ -1936,13 +1954,7 @@ class CursorAdapter(ProviderAdapter):
         data = _load_json(mcp_path)
         mcp_configured = _has_mcp_server(data, MCP_SERVER_NAME)
 
-        agent_id = str(
-            data.get("mcpServers", {})
-            .get(MCP_SERVER_NAME, {})
-            .get("env", {})
-            .get("MEMORYGUARD_AGENT_ID", "")
-            or ""
-        )
+        agent_id = _mcp_env_agent_id(data, self.provider_name, mcp_path.parent / "hooks.json")
         binding_id, binding_status = self._find_binding(agent_id)
         configured = instruction_installed and mcp_configured and bool(agent_id)
         return {
@@ -2107,13 +2119,7 @@ class TraeAdapter(ProviderAdapter):
         )
         data = _load_json(mcp_path)
         mcp_configured = _has_mcp_server(data, MCP_SERVER_NAME)
-        agent_id = str(
-            data.get("mcpServers", {})
-            .get(MCP_SERVER_NAME, {})
-            .get("env", {})
-            .get("MEMORYGUARD_AGENT_ID", "")
-            or ""
-        )
+        agent_id = _mcp_env_agent_id(data, self.provider_name, mcp_path.parent / "hooks.json")
         binding_id, binding_status = self._find_binding(agent_id)
         configured = instruction_installed and mcp_configured and bool(agent_id)
         return {
@@ -2144,15 +2150,182 @@ def get_provider_adapter_class(product: str) -> type[ProviderAdapter] | None:
     return PROVIDER_ADAPTERS.get((product or "").strip().lower())
 
 
+def _provider_tokens_match(declared: str, provider: str) -> bool:
+    left = str(declared or "").strip().casefold().replace("_", "-")
+    right = str(provider or "").strip().casefold().replace("_", "-")
+    if not left:
+        return True
+    groups = (
+        frozenset({"claude", "claude-code"}),
+        frozenset({"codex"}),
+        frozenset({"cursor"}),
+        frozenset({"trae", "trae-cn"}),
+        frozenset({"grok", "xai-grok"}),
+    )
+    for group in groups:
+        if right in group:
+            return left in group
+    return left == right
+
+
+def _hook_agent_ids(path: Path, provider: str) -> set[str]:
+    """Agent ids in one generated hook file. Unreadable files contribute nothing."""
+    from .host_hooks import _generated_handler_binding, _load_json_config
+
+    try:
+        data = _load_json_config(path, strict=False)
+    except Exception:
+        return set()
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return set()
+    found: set[str] = set()
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            handlers = [entry]
+            if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
+                handlers.extend(entry["hooks"])
+            for handler in handlers:
+                binding = _generated_handler_binding(handler)
+                if binding is None:
+                    continue
+                bound_provider, agent_id, _group_id, _workspace = binding
+                if agent_id and _provider_tokens_match(bound_provider, provider):
+                    found.add(agent_id)
+    return found
+
+
+def _provider_hook_paths() -> tuple[tuple[str, Path], ...]:
+    home = Path.home()
+    return (
+        ("claude", home / ".claude" / "settings.json"),
+        ("codex", home / ".codex" / "hooks.json"),
+        ("cursor", home / ".cursor" / "hooks.json"),
+        ("trae", home / ".trae" / "hooks.json"),
+    )
+
+
+def accepted_config_agent_id(
+    env: Mapping[str, Any],
+    provider: str,
+    hook_agent_ids: set[str] | None = None,
+) -> str:
+    """Accept a config agent id only for its own provider and hook evidence.
+
+    A copied id whose provider field or generated hook belongs to another
+    product is not an identity. Missing provider/hook evidence stays legacy.
+    """
+    agent_id = str((env or {}).get("MEMORYGUARD_AGENT_ID") or "").strip()
+    if not agent_id:
+        return ""
+    if not _provider_tokens_match(str((env or {}).get("MEMORYGUARD_PROVIDER") or ""), provider):
+        return ""
+    if hook_agent_ids and agent_id not in hook_agent_ids:
+        return ""
+    return agent_id
+
+
+def foreign_hook_owner(agent_id: str, provider: str) -> str:
+    """Return another provider whose generated hook already binds this id."""
+    token = str(agent_id or "").strip()
+    if not token:
+        return ""
+    for owner, path in _provider_hook_paths():
+        if _provider_tokens_match(owner, provider):
+            continue
+        if token in _hook_agent_ids(path, owner):
+            return owner
+    return ""
+
+
+def _mcp_env_agent_id(data: Mapping[str, Any], provider: str, hook_path: Path) -> str:
+    env = (
+        data.get("mcpServers", {})
+        .get(MCP_SERVER_NAME, {})
+        .get("env", {})
+        or {}
+    )
+    if not isinstance(env, dict):
+        return ""
+    return accepted_config_agent_id(env, provider, _hook_agent_ids(hook_path, provider))
+
+
+def configured_provider_agent_ids() -> dict[str, set[str]]:
+    """Exact endpoint evidence from known user-level MCP/Hook configurations.
+
+    This reads configuration metadata only, never native memory or a store.
+    A generated own-provider Hook wins over a copied, inconsistent MCP id.
+    Conflicting claims without that evidence remain unresolved.
+    """
+    home = Path.home()
+    result: dict[str, set[str]] = {}
+    for provider, config_path, hook_path in (
+        ("claude-code", home / ".claude.json", home / ".claude" / "settings.json"),
+        ("cursor", home / ".cursor" / "mcp.json", home / ".cursor" / "hooks.json"),
+        ("trae", TraeAdapter._user_mcp_config_path(), home / ".trae" / "hooks.json"),
+    ):
+        hook_ids = _hook_agent_ids(hook_path, provider)
+        data = _load_json(config_path)
+        agent_id = _mcp_env_agent_id(data, provider, hook_path)
+        result[provider] = hook_ids | ({agent_id} if agent_id else set())
+    result["codex"] = set(_collect_codex_configured_agent_ids())
+    # mcporter hosts the installed DeepSeek harness connection. Only explicit
+    # provider metadata from MemoryGuard server entries identifies it.
+    servers = _load_json(home / ".mcporter" / "mcporter.json").get("mcpServers", {})
+    if isinstance(servers, dict):
+        for name, server in servers.items():
+            if not str(name).startswith("memoryguard") or not isinstance(server, dict):
+                continue
+            env = server.get("env")
+            if not isinstance(env, dict) or env.get("MEMORYGUARD_PROVIDER") != "deepseek":
+                continue
+            agent_id = accepted_config_agent_id(env, "deepseek")
+            if agent_id:
+                result.setdefault("deepseek", set()).add(agent_id)
+    owners: dict[str, set[str]] = {}
+    for provider, ids in result.items():
+        for agent_id in ids:
+            owners.setdefault(agent_id, set()).add(provider)
+    return {provider: {value for value in ids if len(owners[value]) == 1}
+            for provider, ids in result.items()}
+
+
+def resolve_provider_binding(control: Any, provider: str) -> dict[str, Any]:
+    """Resolve the target product's existing binding, never the caller's id."""
+    from .agent_mapping import normalize_program_identity
+
+    product = normalize_program_identity(provider)["program_id"]
+    identities = configured_provider_agent_ids()
+    candidates = set(identities.get(product, ()))
+    recorded = control.provider_identity(product)
+    if recorded:
+        candidates.add(str(recorded.get("canonical_id") or ""))
+    bindings = {}
+    for agent_id in candidates:
+        if not agent_id or foreign_hook_owner(agent_id, provider):
+            continue
+        if any(agent_id in ids for owner, ids in identities.items() if owner != product):
+            continue
+        binding = control.active_binding_for_agent(agent_id)
+        if binding:
+            bindings[str(binding["binding_id"])] = binding
+    if len(bindings) != 1:
+        raise ValueError("target_provider_identity_unresolved" if not bindings else "target_provider_identity_ambiguous")
+    return next(iter(bindings.values()))
+
+
 def _read_codex_profile_agent_id(config_home: Path) -> str:
     """Read MEMORYGUARD_AGENT_ID from one Codex home; empty if absent/unreadable."""
     config_path = Path(config_home) / "config.toml"
+    hook_ids = _hook_agent_ids(Path(config_home) / "hooks.json", "codex")
     try:
         text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
         data = tomllib.loads(text) if text.strip() else {}
     except Exception:
         ids = {
-            str(block.get("MEMORYGUARD_AGENT_ID") or "").strip()
+            accepted_config_agent_id(block, "codex", hook_ids)
             for block in _memoryguard_env_blocks(
                 config_path.read_text(encoding="utf-8", errors="replace")
             )
@@ -2160,7 +2333,9 @@ def _read_codex_profile_agent_id(config_home: Path) -> str:
         ids.discard("")
         return next(iter(ids)) if len(ids) == 1 else ""
     env = ((data.get("mcp_servers") or {}).get(MCP_SERVER_NAME) or {}).get("env") or {}
-    return str(env.get("MEMORYGUARD_AGENT_ID") or "").strip()
+    if not isinstance(env, dict):
+        return ""
+    return accepted_config_agent_id(env, "codex", hook_ids)
 
 
 def _read_codex_profile_control_hints(config_home: Path) -> set[Path]:
@@ -2195,8 +2370,9 @@ def _read_codex_profile_config_bindings(config_home: Path) -> set[tuple[str, str
     except OSError:
         return set()
     found: set[tuple[str, str]] = set()
+    hook_ids = _hook_agent_ids(Path(config_home) / "hooks.json", "codex")
     for env in _memoryguard_env_blocks(text):
-        agent_id = str(env.get("MEMORYGUARD_AGENT_ID") or "").strip()
+        agent_id = accepted_config_agent_id(env, "codex", hook_ids)
         group_id = str(
             env.get("MEMORYGUARD_SHARE_GROUP_ID")
             or env.get("MEMORYGUARD_GROUP_ID")
@@ -2403,7 +2579,9 @@ def _read_codex_profile_mcp_control_evidence(
     env = server.get("env") or {}
     if not isinstance(env, dict):
         return set()
-    agent_id = str(env.get("MEMORYGUARD_AGENT_ID") or "").strip()
+    agent_id = accepted_config_agent_id(
+        env, "codex", _hook_agent_ids(Path(config_home) / "hooks.json", "codex"),
+    )
     candidate = _absolute_control_home(env.get("MEMORYGUARD_HOME"))
     return {(agent_id, candidate)} if agent_id and candidate is not None else set()
 
@@ -2607,12 +2785,12 @@ def _write_codex_global_home(
         content, _BEGIN_MARKER, _END_MARKER, _instruction_body(share_group_id),
     )
     mcp_path = adapter._mcp_config_path()
-    toml_content = _reconcile_memoryguard_toml_tables(_read_text_for_update(mcp_path))
+    toml_content = _read_text_for_update(mcp_path)
     section = _mcp_toml_section(
         agent_instance_id, adapter.workspace, control_scope="global",
         runtime_python=selected_runtime_python,
     )
-    new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
+    new_toml = _upsert_memoryguard_toml(toml_content, section)
     _validate_toml(new_toml, mcp_path)
     backup = _backup_toml_before_repair(mcp_path, toml_content, new_toml)
     hooks_path = Path(config_home) / "hooks.json"
@@ -2915,16 +3093,21 @@ def repair_global_provider_configs(
             continue
         try:
             group_id = str(binding_data.get("share_group_id") or "")
+            agent_id = str(binding_data.get("agent_instance_id") or instance.instance_id)
             result = cls(data_home).install(
                 data_home,
                 share_group_id=group_id,
-                agent_instance_id=instance.instance_id,
+                agent_instance_id=agent_id,
                 global_scope=True,
+            )
+            from .agent_mapping import normalize_program_identity
+            binding_store.record_provider_identity(
+                normalize_program_identity(provider)["program_id"], agent_id, group_id,
             )
             repaired.append({
                 "provider": provider,
                 "status": "configured",
-                "agent_instance_id": instance.instance_id,
+                "agent_instance_id": agent_id,
                 "share_group_id": group_id,
                 "result": result,
             })

@@ -39,35 +39,28 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.7.12
+## What's New in v0.7.13
 
-v0.7.12 improves MCP discovery, bounded read delivery, and local usage
-telemetry while preserving the existing governed action checks and MCP name:
+v0.7.13 strengthens mandatory-rule replacement and recovery, improves
+audience-aware identity handling, and improves conflict resolution:
 
-- **Compact discovery with a complete catalog:** New MCP clients receive 11
-  day-to-day tools from `tools/list`, including capability discovery and the
-  governed invocation broker. `memoryguard_capabilities` provides paginated
-  metadata for registered MCP operations and reviewed headless GUI operations;
-  exact advanced MCP names remain callable for compatibility.
-- **Bounded read delivery:** Replayable successful reads are capped at 24,000
-  UTF-8 bytes across the complete MCP envelope. Eligible oversized reads return
-  a short-lived process-local reference rather than truncating data; reads that
-  cannot be safely replayed or exceed the snapshot limit return a bounded
-  narrowing hint. Pages support UTF-8 offsets and field selection. Private
-  references revalidate the original read under the current trusted session and
-  binding before each page. Writes and context bootstrap keep their complete
-  receipt/mandatory-rule contracts and cannot request response paging.
-- **Cache-aware local telemetry:** Provider-reported cache-read and cache-write
-  input counts are kept separately with complete/partial/unavailable coverage.
-  A measured zero remains zero; missing provider data remains unknown. The
-  deterministic unit estimate is labeled as an estimate and does not claim a
-  measured token reduction.
-- **Governed invocation:** Mutating broker targets still require confirmation
-  and a non-empty idempotency key, which are forwarded to the target's existing
-  permission, scope, and readiness checks. The MCP name remains
-  `io.github.irisxc4/memoryguard`.
+- **Safe mandatory-rule replacement:** Replacements validate the final
+  mandatory package against audience matching, canonical rules, deduplication,
+  sensitivity checks, and publication budgets. Equivalent unlocked predecessors
+  retire in the same transaction; failed validation rolls back the complete
+  update. See the [replacement and recovery details](docs/mandatory-rule-replacement.md).
+- **Native Agent/group audience matching:** Matching and deduplication no longer
+  split the same native audience solely by provider or runtime role. Distinct
+  Agent identities remain separate, and project-scoped audiences retain their
+  project boundaries. Provider repair uses the verified identity for its target
+  provider.
+- **Readable, atomic conflict resolution:** Conflict views preserve readable
+  peer information, and resolution keeps peer groups intact while applying the
+  selected changes atomically. Ambiguous conflicts remain unresolved.
+- **Cursor Hook protection:** Cursor MemoryGuard Hooks now use a 30-second
+  timeout, up from 15 seconds, with `failClosed: true`.
 
-See the [v0.7.12 release note](docs/releases/v0.7.12.md) and
+See the [v0.7.13 release note](docs/releases/v0.7.13.md) and
 [release history](CHANGELOG.md).
 
 Earlier release details are kept in the [Changelog](CHANGELOG.md) and
@@ -723,6 +716,7 @@ reviewed operation metadata.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.13 release note](docs/releases/v0.7.13.md)
 - [v0.7.12 release note](docs/releases/v0.7.12.md)
 - [v0.7.11 release note](docs/releases/v0.7.11.md)
 - [v0.7.9 release record](docs/releases/v0.7.9.md)

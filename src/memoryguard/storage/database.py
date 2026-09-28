@@ -7,11 +7,13 @@ read-only connections are therefore guaranteed not to create tables.
 
 from __future__ import annotations
 
+import atexit
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
+import threading
 from typing import Iterator
 from urllib.parse import quote
 
@@ -28,19 +30,84 @@ def _readonly_uri(path: Path, *, immutable: bool = False) -> str:
 
 
 def _copy_sqlite_snapshot(source: Path, target: Path) -> None:
-    """Copy a SQLite database and its WAL companions to a private path.
+    """Copy a SQLite database and its WAL to a private path.
 
     Older SQLite builds may checkpoint a WAL database when the final read-only
     connection closes.  A preflight must be physically side-effect free, so
     callers that need that guarantee inspect this private copy instead of the
     live database.  Copying the main file before the WAL lets SQLite reject a
-    concurrently changing source as a stale/inconsistent snapshot.
+    concurrently changing source as a stale/inconsistent snapshot.  The SHM
+    file is a derived WAL index with live process locks, not durable data.
+    CopyFile2 on Windows rejects it while another connection holds a lock.
+    Let SQLite rebuild that index from the copied WAL in the private directory.
     """
 
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-wal"):
         source_file = Path(str(source) + suffix)
         if source_file.is_file():
             shutil.copy2(source_file, Path(str(target) + suffix))
+
+
+# Snapshot reuse within one process.  A hook invocation performs on the order of
+# a hundred bounded reads; copying the same unchanged database for every one of
+# them dominated hook latency.  The fingerprint covers the main file and both
+# WAL companions, so any source write invalidates the cached copy.
+_SNAPSHOT_LOCK = threading.Lock()
+_SNAPSHOT_CACHE: dict[tuple, tuple[tempfile.TemporaryDirectory, Path]] = {}
+
+
+def _snapshot_fingerprint(source: Path) -> tuple:
+    parts: list[tuple[str, int, int]] = []
+    for suffix in ("", "-wal", "-shm"):
+        companion = Path(str(source) + suffix)
+        try:
+            stat = companion.stat()
+        except OSError:
+            continue
+        parts.append((suffix, stat.st_size, stat.st_mtime_ns))
+    return (str(source), tuple(parts))
+
+
+def _discard_snapshot(holder: tempfile.TemporaryDirectory) -> None:
+    try:
+        holder.cleanup()
+    except Exception:
+        # A locked temporary file must never break the caller; the OS reclaims
+        # the directory when the process exits.
+        pass
+
+
+def release_database_snapshots() -> None:
+    """Drop every cached snapshot copy held by this process."""
+
+    with _SNAPSHOT_LOCK:
+        for holder, _ in _SNAPSHOT_CACHE.values():
+            _discard_snapshot(holder)
+        _SNAPSHOT_CACHE.clear()
+
+
+atexit.register(release_database_snapshots)
+
+
+def _acquire_snapshot(source: Path) -> Path:
+    key = _snapshot_fingerprint(source)
+    with _SNAPSHOT_LOCK:
+        cached = _SNAPSHOT_CACHE.get(key)
+        if cached is not None:
+            return cached[1]
+        # The source moved on; retire any copy still held for this path.
+        for stale in [item for item in _SNAPSHOT_CACHE if item[0] == str(source)]:
+            holder, _ = _SNAPSHOT_CACHE.pop(stale)
+            _discard_snapshot(holder)
+        holder = tempfile.TemporaryDirectory(prefix="memoryguard-db-read-")
+        snapshot = Path(holder.name) / source.name
+        try:
+            _copy_sqlite_snapshot(source, snapshot)
+        except Exception:
+            _discard_snapshot(holder)
+            raise
+        _SNAPSHOT_CACHE[key] = (holder, snapshot)
+        return snapshot
 
 
 def connect_database(
@@ -139,28 +206,34 @@ def open_database_snapshot(
 ) -> Iterator[sqlite3.Connection]:
     """Read a private SQLite snapshot without mutating the source database.
 
-    The snapshot includes the main file and any ``-wal``/``-shm`` companions,
-    so uncheckpointed metadata remains visible.  SQLite may checkpoint while
+    The snapshot includes the main file and its ``-wal`` companion, so
+    uncheckpointed metadata remains visible; its SHM index is rebuilt locally.
+    SQLite may checkpoint while
     closing the temporary connection, but that can only change the temporary
     directory.  The connection is write-capable only against the copied files,
     never against ``source``.
+
+    The copy is reused for the lifetime of the process while ``source`` and its
+    WAL companions keep the same size and mtime, so repeated reads share one
+    warm copy instead of re-copying the database.  Because the copy is shared,
+    a caller that writes to the snapshot exposes those writes to later readers
+    in the same process; this API is for reading, and such writes are discarded
+    either way.
     """
 
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(source)
-    with tempfile.TemporaryDirectory(prefix="memoryguard-db-read-") as directory:
-        snapshot = Path(directory) / source.name
-        _copy_sqlite_snapshot(source, snapshot)
-        conn = connect_database(
-            snapshot,
-            timeout=timeout,
-            busy_timeout_ms=busy_timeout_ms,
-        )
-        try:
-            yield conn
-        finally:
-            conn.close()
+    snapshot = _acquire_snapshot(source)
+    conn = connect_database(
+        snapshot,
+        timeout=timeout,
+        busy_timeout_ms=busy_timeout_ms,
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def execute_sql_script(conn: sqlite3.Connection, script: str) -> None:

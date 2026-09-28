@@ -258,6 +258,8 @@ _FULL_TOOLS = [
         "name": "memoryguard_memory_update",
         "description": (
             "Use when owner must correct body, kind, recall policy, or priority of one known memory. "
+            "Use related_updates with expected revisions, reason and retry key to replace linked rules atomically; "
+            "preview validates the final package without committing. This recovery entrance remains available when bootstrap is blocked. "
             "Do not use to create a record, change lifecycle status, or modify another owner's memory."
         ),
         "inputSchema": {
@@ -266,6 +268,10 @@ _FULL_TOOLS = [
                 "memory_id": {"type": "string", "description": "memory record ID"},
                 "atom_id": {"type": "string", "description": "V2 atom ID; use the source-mapping target when a migrated logical ID is ambiguous"},
                 "body": {"type": "string", "description": "new body"},
+                "expected_revision": {"type": "integer", "minimum": 1, "description": "reject stale edits; required for every target in related updates or preview"},
+                "related_updates": {"type": "array", "maxItems": 19, "description": "additional owner-controlled replacements committed together; every item requires memory_id and expected_revision; accepts body, kind, injection_policy, priority, audience and atom_id", "items": {"type": "object", "required": ["memory_id", "expected_revision"]}},
+                "preview": {"type": "boolean", "description": "run the atomic update and budget checks, then roll back; requires expected_revision, idempotency_key and reason"},
+                "reason": {"type": "string", "description": "audit reason required for related updates or preview"},
                 "kind": {"type": "string", "enum": ["preference", "fact", "project", "procedure", "episode", "correction"], "description": "replacement kind; omit to preserve current kind"},
                 "injection_policy": {"type": "string", "enum": ["relevant", "always"], "description": "new injection policy"},
                 "priority": {"type": "integer", "minimum": -100, "maximum": 100, "description": "new priority"},
@@ -1124,7 +1130,7 @@ _FULL_TOOLS.extend([
     },
     {
         "name": "memoryguard_invoke",
-        "description": "Invoke one explicitly registered MCP operation found through memoryguard_capabilities. Never accepts native handler or GUI method names. Mutating targets require confirmed=true and idempotency_key.",
+        "description": "Invoke one operation published by memoryguard_capabilities, including a headless broker operation that shares a GUI name. Never accepts an unpublished native handler. Mutating targets require confirmed=true and idempotency_key.",
         "inputSchema": {"type": "object", "properties": {
             "operation": {"type": "string", "description": "registered MCP operation name from capability catalog"},
             "arguments": {"type": "object", "description": "arguments for that registered operation"},

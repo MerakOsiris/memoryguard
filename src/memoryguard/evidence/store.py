@@ -245,6 +245,7 @@ class EvidenceStore:
         path: str | Path | None = None,
         readonly: bool = False,
         read_only: bool | None = None,
+        initialize: bool = True,
     ) -> None:
         if read_only is not None:
             readonly = bool(read_only)
@@ -263,7 +264,7 @@ class EvidenceStore:
         self.db_path = _path_for(path if path is not None else workspace_or_path, "evidence")
         self.path = self.db_path
         self.readonly = bool(readonly)
-        if self.readonly:
+        if self.readonly or not initialize:
             if not self.db_path.is_file():
                 raise FileNotFoundError(self.db_path)
             self._check_schema(readonly=True)
@@ -447,6 +448,7 @@ class EvidenceStore:
         *,
         event_id: str = "",
         _sequence: list[int] | None = None,
+        _schema: str = "main",
     ) -> str:
         """Record an immutable evidence-domain event in the same transaction.
 
@@ -461,22 +463,24 @@ class EvidenceStore:
             raise ValueError("evidence outbox payload must be a JSON object")
         event_id = event_id or _digest({"event_type": event_type, "aggregate_id": aggregate_id, "payload": checked})
         now = _now()
-        existing_event = conn.execute("SELECT sequence FROM domain_outbox WHERE event_id=?", (event_id,)).fetchone()
+        if _schema not in {"main", "publication_evidence"}:
+            raise ValueError("invalid evidence schema")
+        existing_event = conn.execute(f"SELECT sequence FROM {_schema}.domain_outbox WHERE event_id=?", (event_id,)).fetchone()
         if existing_event is not None:
             sequence = int(existing_event[0])
         elif _sequence is None:
-            sequence = self._next_sequence(conn)
+            sequence = int(conn.execute(f"SELECT COALESCE(MAX(sequence),0)+1 FROM {_schema}.domain_outbox").fetchone()[0])
         else:
             _sequence[0] += 1
             sequence = int(_sequence[0])
         conn.execute(
-            "INSERT INTO domain_outbox(event_id,sequence,event_type,aggregate_id,payload_json,status,attempts,created_at,projected_at) VALUES(?,?,?,?,?,'projected',1,?,?) ON CONFLICT(event_id) DO NOTHING",
+            f"INSERT INTO {_schema}.domain_outbox(event_id,sequence,event_type,aggregate_id,payload_json,status,attempts,created_at,projected_at) VALUES(?,?,?,?,?,'projected',1,?,?) ON CONFLICT(event_id) DO NOTHING",
             (event_id, sequence, str(event_type), str(aggregate_id), _json(checked), now, now),
         )
-        row = conn.execute("SELECT sequence FROM domain_outbox WHERE event_id=?", (event_id,)).fetchone()
+        row = conn.execute(f"SELECT sequence FROM {_schema}.domain_outbox WHERE event_id=?", (event_id,)).fetchone()
         if row is not None:
             conn.execute(
-                "UPDATE outbox_checkpoints SET last_sequence=?,updated_at=? WHERE domain='evidence' AND last_sequence<?",
+                f"UPDATE {_schema}.outbox_checkpoints SET last_sequence=?,updated_at=? WHERE domain='evidence' AND last_sequence<?",
                 (int(row[0]), now, int(row[0])),
             )
         return event_id
@@ -504,6 +508,8 @@ class EvidenceStore:
         conn: sqlite3.Connection,
         event: Mapping[str, Any],
         sequence: list[int],
+        *,
+        schema: str = "main",
     ) -> str:
         """Apply one memory ``evidence.put_link`` event on borrowed connection.
 
@@ -516,6 +522,11 @@ class EvidenceStore:
         evidence_value = payload.get("evidence") or payload
         if not isinstance(evidence_value, (Evidence, Mapping)):
             raise ValueError("outbox evidence payload must be an object")
+        explicit_evidence_id = (
+            bool(str(evidence_value.get("evidence_id") or ""))
+            if isinstance(evidence_value, Mapping)
+            else bool(str(getattr(evidence_value, "evidence_id", "") or ""))
+        )
         item = self._coerce_evidence(evidence_value)
         validate_authority(item.authority)
         item = Evidence.from_value(item, created_at=item.created_at or _now())
@@ -535,6 +546,31 @@ class EvidenceStore:
             existing_metadata = json.loads(existing[7] or "{}")
         except (TypeError, ValueError):
             existing_metadata = None
+        metadata_matches = existing_metadata == meta
+        if (
+            not metadata_matches
+            and not explicit_evidence_id
+            and isinstance(existing_metadata, Mapping)
+        ):
+            # Only mutable atom policy from legacy automatic events is
+            # ignored; the existing evidence row is never rewritten.
+            missing_policy = object()
+            existing_policy = existing_metadata.get("injection_policy", missing_policy)
+            incoming_policy = meta.get("injection_policy", missing_policy)
+            policy_value_is_legacy = lambda value: (
+                value is missing_policy
+                or isinstance(value, str) and value in {"relevant", "always"}
+            )
+            existing_source_metadata = dict(existing_metadata)
+            incoming_source_metadata = dict(meta)
+            existing_source_metadata.pop("injection_policy", None)
+            incoming_source_metadata.pop("injection_policy", None)
+            metadata_matches = (
+                existing_source_metadata == incoming_source_metadata
+                and existing_policy != incoming_policy
+                and policy_value_is_legacy(existing_policy)
+                and policy_value_is_legacy(incoming_policy)
+            )
         if not (
             str(existing[1]) == item.evidence_type
             and str(existing[2]) == item.source_ref
@@ -542,7 +578,7 @@ class EvidenceStore:
             and str(existing[4]) == item.digest
             and str(existing[5]) == item.authority
             and str(existing[6]) == item.status
-            and existing_metadata == meta
+            and metadata_matches
         ):
             raise ValueError(f"evidence_id conflict: {item.evidence_id}")
         if existing_before is None:
@@ -561,6 +597,7 @@ class EvidenceStore:
                     "metadata": meta,
                 },
                 _sequence=sequence,
+                _schema=schema,
             )
 
         subject_type = str(payload.get("subject_type") or "atom")
@@ -592,6 +629,7 @@ class EvidenceStore:
                     "metadata": link_meta,
                 },
                 _sequence=sequence,
+                _schema=schema,
             )
         return item.evidence_id
 
@@ -606,9 +644,13 @@ class EvidenceStore:
             raise PermissionError("evidence store is read-only")
         if not events:
             return {}
-        conn = self._checked_connect(readonly=False)
+        from ..governance_v2.atomic import evidence_connection
+
+        borrowed = evidence_connection(self.db_path)
+        schema = "publication_evidence" if borrowed is not None else "main"
+        conn = borrowed or self._checked_connect(readonly=False)
         try:
-            row = conn.execute("SELECT COALESCE(MAX(sequence),0) FROM domain_outbox").fetchone()
+            row = conn.execute(f"SELECT COALESCE(MAX(sequence),0) FROM {schema}.domain_outbox").fetchone()
             sequence = [int(row[0] or 0)]
             result: dict[str, str] = {}
             with transaction(conn):
@@ -616,7 +658,7 @@ class EvidenceStore:
                     event_id = str(event.get("event_id") or "")
                     if not event_id:
                         raise ValueError("memory evidence event_id is required")
-                    result[event_id] = self._project_event_on_connection(conn, event, sequence)
+                    result[event_id] = self._project_event_on_connection(conn, event, sequence, schema=schema)
             return result
         finally:
             conn.close()

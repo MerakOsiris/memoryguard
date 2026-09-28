@@ -117,6 +117,7 @@ PRODUCT_DISPLAY_NAMES: dict[str, str] = {
     "codex": "Codex",
     "cursor": "Cursor",
     "grok": "Grok",
+    "deepseek": "DeepSeek Harness",
     "trae": "Trae",
     "windsurf": "Windsurf",
     "zcode": "zcode",
@@ -139,6 +140,8 @@ PROGRAM_ID_ALIASES: dict[str, str] = {
     "grok-cli": "grok",
     "xai-grok": "grok",
     "claude-code": "claude-code",
+    "claude": "claude-code",
+    "dsh": "deepseek",
     "cursor-agent": "cursor",
     "codeium": "windsurf",
 }
@@ -210,6 +213,33 @@ def normalize_program_identity(
 def product_for_dot_dir(dot_dir_name: str) -> str | None:
     """返回点目录对应的产品名。未匹配返回 None。"""
     return AGENT_PRODUCT_MAP.get(dot_dir_name)
+
+
+def backup_dir_name(name: str) -> bool:
+    folded = str(name or "").casefold()
+    return any(token in folded for token in ("backup", ".bak", "-bak", ".old", "-old", ".copy", "-copy"))
+
+
+def unmapped_agent_evidence(path: str | Path) -> bool:
+    """True when an unmapped directory has an install file. Does not read contents."""
+    try:
+        names = {child.name.casefold() for child in Path(path).iterdir() if child.is_file()}
+    except OSError:
+        return False
+    return bool(names & {"mcp.json", ".mcp.json", "hooks.json"})
+
+
+def candidate_visible(dir_name: str, product: str, dir_path: str | Path) -> bool:
+    """Mapped products stay visible. Ordinary hidden dirs and backups do not.
+
+    An unmapped directory is unresolved, never a formal agent, and only when
+    an install filename is present. Name alone is not evidence.
+    """
+    if backup_dir_name(dir_name):
+        return False
+    if str(product or "") not in {"", "unknown"}:
+        return True
+    return unmapped_agent_evidence(dir_path)
 
 
 def is_known_product(product_name: str) -> bool:

@@ -378,15 +378,18 @@ class V2MemoryOrganizer:
         if not evidence and not data.get("evidence_ids") and not data.get("_preserve_provenance"):
             evidence = [{
                 "source_ref": source_ref,
+                # Auto events without an explicit source all use "event:".
+                # Their actor-bound event ID must participate in evidence
+                # identity, or two private rules with equal text collide.
+                "revision": event_id,
                 "digest": digest,
                 "authority": "observed",
-                    "metadata": {
-                        "source_event_id": event_id,
-                        "agent_instance_id": agent,
-                        "share_group_id": self.share_group_id,
-                        "kind": kind,
+                "metadata": {
+                    "source_event_id": event_id,
+                    "agent_instance_id": agent,
+                    "share_group_id": self.share_group_id,
+                    "kind": kind,
                     "classification_override": classification_override,
-                    "injection_policy": policy,
                 },
             }]
         mappings = list(data.get("source_mappings") or ())
@@ -1116,9 +1119,13 @@ class V2MemoryOrganizer:
             # A non-empty runtime role is the explicit shared execution plane
             # used by native fan-in/correction callers; do not widen the
             # default public MCP audience merely because the body is exact.
-            if not candidate_scope[5] or not incoming_scope[5]:
+            if not left.runtime_role or not prepared.get("runtime_role"):
                 return False
-            return candidate_scope[2:] == incoming_scope[2:]
+            return (
+                candidate_scope[2:] == incoming_scope[2:]
+                and (left.project_ref, left.provider, left.runtime_role)
+                == (prepared.get("project_ref"), prepared.get("provider"), prepared.get("runtime_role"))
+            )
 
         def correction_relation(left: MemoryAtom) -> GovernanceRelation | None:
             """Match an explicit version/value correction to its old subject.
@@ -1257,6 +1264,49 @@ class V2MemoryOrganizer:
         return refreshed, receipt
 
     def write(self, payload: Mapping[str, Any] | None = None, *, context: Any | None = None, **kwargs: Any) -> dict[str, Any]:
+        # Selection, replacement and retiring the predecessor must observe a
+        # single serialized snapshot, including across MCP server processes.
+        with self.governance.atomic_memory():
+            before = self.store.list_atoms(scope=self.scope, include_building=True)
+            result = self._write_atomic(payload, context=context, **kwargs)
+            atom = result["atom"]
+            if atom.status != "active":
+                return result
+            predecessor_ids = set(atom.supersedes)
+            anchors = [old for old in before if old.atom_id == atom.atom_id or old.memory_id in predecessor_ids]
+            if not anchors:
+                anchors = [atom]
+            duplicates = [
+                old for old in before
+                if old.atom_id != atom.atom_id and old.status == "active" and not old.locked
+                and old.memory_id not in predecessor_ids
+                and any(
+                    self._scope_key_for_atom(old) == self._scope_key_for_atom(anchor)
+                    and old.injection_policy == anchor.injection_policy
+                    and classify_governance_relation(old.body, anchor.body).kind in {"exact", "equivalent"}
+                    for anchor in anchors
+                )
+            ]
+            if duplicates:
+                # Publish the staged target *inside* this transaction before
+                # adding supersession revisions.  Otherwise a relationship
+                # revision could overwrite the staged replacement body.
+                projection = self.store.project_evidence(self.governance.evidence)
+                if projection.get("failed") or projection.get("pending"):
+                    raise OrganizationError("v2_memory_publication_failed")
+                for old in duplicates:
+                    self.governance.supersede(
+                        old.atom_id, atom.atom_id, context=self._canonical_context,
+                        reason="consolidate duplicate replacement predecessors",
+                        idempotency_key="replacement-duplicate:" + stable_digest({
+                            "old": old.atom_id, "new": atom.atom_id, "revision": atom.revision,
+                        }),
+                    )
+                    result["actions"].append({"action": "supersede_duplicate", "old_id": old.memory_id})
+                result["atom"] = self.store.get_atom(atom.memory_id, scope=self.scope, include_building=True) or atom
+            return result
+
+    def _write_atomic(self, payload: Mapping[str, Any] | None = None, *, context: Any | None = None, **kwargs: Any) -> dict[str, Any]:
         # Organizer normalization is allowed to consume nested metadata,
         # evidence, and source mappings.  Keep caller-owned request data
         # immutable even when this service is called below NativePort.

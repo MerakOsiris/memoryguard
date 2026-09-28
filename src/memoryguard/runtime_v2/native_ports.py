@@ -965,6 +965,7 @@ class NativeV2RuntimePort:
         "list_rule_match_receipts": ("gui_rule_receipts", "implemented", False),
         "list_rule_exceptions": ("gui_rule_exceptions", "implemented", False),
         "update_rule_audience": ("gui_rule_audience_update", "implemented", True),
+        "update_rule_body": ("gui_rule_body_update", "implemented", True),
         "knowledge_list": ("knowledge_read", "implemented", False),
         "knowledge_search": ("knowledge_read", "implemented", False),
         "knowledge_read": ("knowledge_read", "implemented", False),
@@ -980,6 +981,7 @@ class NativeV2RuntimePort:
         "groups": ("cli_groups", "implemented", False),
         "mcp-status": ("cli_mcp_status", "implemented", False),
         "doctor": ("cli_doctor", "implemented", False),
+        "runtime": ("cli_runtime", "implemented", False),
         # Host UI/executor actions run only after this native manifest gate.
         "gui": ("cli_gui", "implemented", False),
         "open": ("cli_open", "implemented", False),
@@ -1838,13 +1840,13 @@ class NativeV2RuntimePort:
                 self._assert_schema_lease(lease)
             if domain == "memory":
                 from ..memory.store import MemoryAtomStore
-                value = MemoryAtomStore(self.workspace, readonly=not write)
+                value = MemoryAtomStore(self.workspace, readonly=not write, initialize=False)
             elif domain == "evidence":
                 from ..evidence.store import EvidenceStore
-                value = EvidenceStore(self.workspace, readonly=not write)
+                value = EvidenceStore(self.workspace, readonly=not write, initialize=False)
             elif domain == "rules":
                 from ..rules.v2_store import RuleV2Store
-                value = RuleV2Store(self.workspace, read_only=not write)
+                value = RuleV2Store(self.workspace, read_only=not write, initialize=False)
             elif domain == "assets":
                 from ..assets_v2.store import AssetStore
                 value = AssetStore(self.workspace, readonly=not write, initialize=False)
@@ -1929,6 +1931,11 @@ class NativeV2RuntimePort:
     def _map_governance_error(error: Exception) -> NativePortError:
         """Translate governance failures to stable native transport codes."""
 
+        if isinstance(error, sqlite3.Error):
+            code = int(getattr(error, "sqlite_errorcode", 0) or 0) & 0xff
+            if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                return NativePortError("v2_governance_busy")
+            return NativePortError("v2_governance_storage_error")
         try:
             from ..governance_v2.context import V2ContextError, V2ScopeError
             from ..governance_v2.boundary import V2GovernanceError
@@ -2050,6 +2057,7 @@ class NativeV2RuntimePort:
         context: Mapping[str, Any],
         *,
         status: Any = "active",
+        suppress_rule_sources: bool = True,
     ) -> list[Any]:
         """Collapse active memory aliases/supersession chains by IDs.
 
@@ -2058,7 +2066,7 @@ class NativeV2RuntimePort:
         its raw memory mirror in cross-category GUI/MCP projections.
         """
 
-        source_memory_ids = self._active_rule_source_memory_ids(context)
+        source_memory_ids = self._active_rule_source_memory_ids(context) if suppress_rule_sources else set()
         candidates: list[tuple[str, str, Any]] = []
         superseded_ids: set[str] = set()
         for row in rows:
@@ -2305,10 +2313,29 @@ class NativeV2RuntimePort:
             raise NativePortError("memory_not_found")
         return result
 
+    def _mandatory_snapshot(self, context: Mapping[str, Any]) -> list[Any]:
+        from .mandatory_publication import snapshot
+
+        return snapshot(self, context)
+
+    def _validate_mandatory_publication(self, context: Mapping[str, Any], before: list[Any]) -> dict[str, Any]:
+        from .mandatory_publication import MandatoryPublicationError, validate
+
+        try:
+            return validate(self, context, before)
+        except MandatoryPublicationError as exc:
+            raise NativePortError(exc.code) from exc
+
     def _memory_write(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
         scope = self._scope(context)
         with _native_memory_mutation_lock(self.workspace, scope["share_group_id"]):
-            return self._memory_write_unlocked(payload, context, **kwargs)
+            governance = self._governance_boundary()
+            with governance.atomic_memory() as owner:
+                before = self._mandatory_snapshot(context) if owner else []
+                result = self._memory_write_unlocked(payload, context, **kwargs)
+                if owner:
+                    self._validate_mandatory_publication(context, before)
+                return result
 
     def _memory_write_unlocked(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         clean = dict(payload)
@@ -2470,9 +2497,101 @@ class NativeV2RuntimePort:
         return response
 
     def _memory_update(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
+        if "status" in payload and payload.get("_native_gui_state_capability") is not _GUI_STATE_PRESERVATION_CAPABILITY:
+            raise NativePortError("memory_lifecycle_governance_required")
+        if "related_updates" in payload or "preview" in payload:
+            return self._memory_update_related(payload, context)
         scope = self._scope(context)
         with _native_memory_mutation_lock(self.workspace, scope["share_group_id"]):
-            return self._memory_update_unlocked(payload, context, **kwargs)
+            governance = self._governance_boundary()
+            with governance.atomic_memory() as owner:
+                before = self._mandatory_snapshot(context) if owner else []
+                result = self._memory_update_unlocked(payload, context, **kwargs)
+                if owner:
+                    self._validate_mandatory_publication(context, before)
+                return result
+
+    def _memory_update_related(self, payload: Mapping[str, Any], context: Mapping[str, Any]) -> Any:
+        """Owner-bound recovery through the existing MCP update entrance.
+
+        All revisions are checked before any mutation.  A preview executes the
+        real write/publication/validation path and rolls it back.  The request
+        receipt is in the same transaction as every related replacement.
+        """
+        related = payload.get("related_updates", [])
+        preview = payload.get("preview", False)
+        if type(preview) is not bool or not isinstance(related, list) or len(related) > 19:
+            raise NativePortError("invalid_related_updates")
+        key = _text(payload.get("idempotency_key"))
+        reason = _text(payload.get("reason"))
+        if not key or not reason:
+            raise NativePortError("related_update_key_and_reason_required")
+        fields = {"memory_id", "atom_id", "body", "kind", "injection_policy", "priority", "audience", "expected_revision"}
+        if "status" in payload:
+            raise NativePortError("invalid_related_updates")
+        primary = {name: value for name, value in payload.items() if name in fields}
+        updates = [primary] + related
+        for item in updates:
+            if not isinstance(item, Mapping) or set(item) - fields:
+                raise NativePortError("invalid_related_updates")
+            if not _text(item.get("memory_id")) or type(item.get("expected_revision")) is not int or item["expected_revision"] < 1:
+                raise NativePortError("related_update_revision_required")
+        if len({_text(item["memory_id"]) for item in updates}) != len(updates):
+            raise NativePortError("duplicate_update_target")
+
+        class PreviewComplete(Exception):
+            def __init__(self, result: dict[str, Any]) -> None:
+                self.result = result
+
+        governance = self._governance_boundary()
+        mutation_context = governance._context(self._mutation_context(context))
+        scope = self._scope(context)
+        try:
+            with _native_memory_mutation_lock(self.workspace, scope["share_group_id"]), governance.atomic_memory():
+                current = []
+                for item in updates:
+                    atom = self._memory_read(item, context)
+                    if atom is None:
+                        raise NativePortError("memory_not_found")
+                    self._require_memory_owner(atom, context)
+                    current.append(atom)
+                request_key, fingerprint = governance._request_identity(
+                    "update_related", {"updates": updates, "reason": reason}, mutation_context, "related:" + key,
+                )
+                replay, claim = governance._claim_request(mutation_context, "update_related", request_key, fingerprint)
+                if replay is not None:
+                    return {"committed": True, "idempotent_replay": True, "receipt": replay.to_dict()}
+                if any(atom.revision != item["expected_revision"] for atom, item in zip(current, updates)):
+                    raise NativePortError("memory_revision_conflict")
+                before = self._mandatory_snapshot(context)
+                results = []
+                for index, item in enumerate(updates):
+                    clean = {name: value for name, value in item.items() if name != "expected_revision"}
+                    clean["idempotency_key"] = f"related:{key}:{index}"
+                    results.append(self._memory_update_unlocked(clean, context))
+                budget = self._validate_mandatory_publication(context, before)
+                updated = [self._memory_read(item, context) for item in updates]
+                receipt = governance._record(
+                    "update_related", {"memory_ids": [item["memory_id"] for item in updates]}, mutation_context,
+                    {"atoms": [governance._atom_snapshot(atom) for atom in current]},
+                    {"atoms": [governance._atom_snapshot(atom) for atom in updated]},
+                    reason=reason, confidence=1.0, idempotency_key=request_key,
+                    request_fingerprint=fingerprint, claim=claim,
+                )
+                result = {"committed": not preview, "preview": preview, "budget": budget,
+                          "updates": results, "receipt": receipt.to_dict() if not preview else None}
+                if preview:
+                    # Never return durable-looking per-item receipts for a
+                    # transaction intentionally rolled back by preview.
+                    result["updates"] = [{"memory_id": atom.memory_id, "revision": atom.revision} for atom in updated]
+                    raise PreviewComplete(result)
+                return result
+        except PreviewComplete as done:
+            return done.result
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise self._map_governance_error(exc) from exc
 
     def _memory_update_unlocked(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         clean = dict(payload)
@@ -2499,6 +2618,14 @@ class NativeV2RuntimePort:
             if _text(getattr(exc, "code", "")) == "memory_not_found":
                 raise NativePortError("v2_governance_rejected") from exc
             raise
+        if (clean.get("_native_gui_state_capability") is not _GUI_STATE_PRESERVATION_CAPABILITY
+                or clean.get("_native_gui_state_action") == "edit"):
+            self._require_unlinked_memory(existing, context)
+        expected_revision = clean.pop("expected_revision", None)
+        if expected_revision is not None and (
+            type(expected_revision) is not int or expected_revision != getattr(existing, "revision", None)
+        ):
+            raise NativePortError("memory_revision_conflict")
         if hasattr(existing, "to_dict"):
             merged = dict(existing.to_dict())
         elif isinstance(existing, Mapping):
@@ -2517,6 +2644,30 @@ class NativeV2RuntimePort:
             if owner:
                 merged["_trusted_owner_agent_id"] = owner
         return self._memory_write(merged, context)
+
+    def _require_unlinked_memory(self, atom: Any, context: Mapping[str, Any]) -> None:
+        """Canonical rule mirrors cannot be repaired through a memory update.
+
+        Editing the mirror alone would report success while bootstrap still
+        uses the canonical rule's unchanged body. Preserve both stores and
+        require the governed GUI operation instead. Read errors fail closed.
+        """
+        if not self.layout.rules_db.is_file():
+            return
+        from ..rule_reconciliation import canonical_reconciliation_status
+
+        readiness = canonical_reconciliation_status(self.workspace, context["share_group_id"])
+        if readiness.get("failures") == ["rule_intelligence_not_initialized"]:
+            return
+        rules = self._domain_store("rules")
+        memory = self._domain_store("memory")
+        source_ids = {atom.memory_id} | {
+            _text(row.get("source_record_id"))
+            for row in memory.list_source_mappings(atom_id=atom.atom_id)
+        }
+        links = rules.list_source_links(share_group_id=context["share_group_id"], status="active")
+        if any(_text(self._row_value(link, "memory_id")) in source_ids for link in links):
+            raise NativePortError("canonical_rule_governance_required")
 
     def _memory_delete(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         memory_id = _text(payload.get("memory_id") or payload.get("id"))
@@ -2799,6 +2950,8 @@ class NativeV2RuntimePort:
         group: str,
         scope_public: Mapping[str, Any],
         result: dict[str, Any],
+        catalog: dict[Any, Any] | None = None,
+        rules_store: Any = None,
     ) -> dict[str, set[str]]:
         """Read V2 rules and return source records represented by layer.
 
@@ -2812,7 +2965,19 @@ class NativeV2RuntimePort:
 
         from ..rule_reconciliation import canonical_reconciliation_status
 
-        readiness = canonical_reconciliation_status(self.workspace, group)
+        # Publication checks many audience partitions against the same catalog.
+        # Only the caller's current request may reuse these reads; scope matching
+        # below still runs independently for every partition.
+        if catalog is None:
+            catalog = {}
+
+        def cached(key: tuple, read_value: Any) -> Any:
+            scoped_key = (str(self.workspace), group, *key)
+            if scoped_key not in catalog:
+                catalog[scoped_key] = read_value()
+            return catalog[scoped_key]
+
+        readiness = cached(("readiness",), lambda: canonical_reconciliation_status(self.workspace, group, store=rules_store))
         failures = readiness.get("failures") or []
         # ``initialize_all`` creates the Phase-1 rules placeholder before the
         # optional V2 rule-intelligence schema is installed.  That is a valid
@@ -2825,8 +2990,11 @@ class NativeV2RuntimePort:
         if failures == ["native_canonical_status_unavailable"]:
             raise RuntimeError("canonical status unavailable")
         canonical_ready = bool(readiness.get("canonical_ready"))
-        rules = self._domain_store("rules")
-        definitions = rules.list_definitions(status="active")
+        rules = rules_store if rules_store is not None else self._domain_store("rules")
+        definitions = cached(("definitions",), lambda: rules.list_definitions(status="active"))
+
+        def canonical_id(value: Any) -> str:
+            return cached(("head", _text(value)), lambda: self._canonical_rule_id(rules, value))
         represented_source_ids: dict[str, set[str]] = {
             "mandatory": set(),
             "relevant": set(),
@@ -2834,24 +3002,26 @@ class NativeV2RuntimePort:
         links_by_definition: dict[str, list[dict[str, Any]]] = {}
         read = getattr(rules, "_read", None)
         if callable(read):
-            source_links = read(lambda conn: [
+            source_links = cached(("links",), lambda: read(lambda conn: [
                 dict(row) for row in conn.execute(
                     "SELECT * FROM rule_source_links "
                     "WHERE share_group_id=? AND status='active' "
                     "ORDER BY source_link_id",
                     (group,),
                 ).fetchall()
-            ])
+            ]))
             for link in source_links:
-                definition_id = _text(link.get("canonical_definition_id"))
+                definition_id = canonical_id(link.get("canonical_definition_id"))
                 if definition_id:
                     links_by_definition.setdefault(definition_id, []).append(link)
         for definition in definitions:
-            bindings = rules.list_bindings(
+            if canonical_id(definition.definition_id) != definition.definition_id:
+                continue
+            bindings = cached(("bindings", definition.definition_id), lambda: rules.list_bindings(
                 definition_id=definition.definition_id,
                 share_group_id=group,
                 status="active",
-            )
+            ))
             includes = [
                 item for item in bindings
                 if _text(getattr(item, "effect", "include")).casefold() != "exclude"
@@ -2881,14 +3051,14 @@ class NativeV2RuntimePort:
                 memory_id = _text(link.get("memory_id"))
                 if not memory_id:
                     raise RuntimeError("native rule source link unavailable")
-                evidence_rows = read(lambda conn: [
+                evidence_rows = cached(("evidence", definition.definition_id, memory_id), lambda: read(lambda conn: [
                     dict(row) for row in conn.execute(
                         "SELECT * FROM rule_evidence_refs "
                         "WHERE share_group_id=? AND definition_id=? "
                         "AND source_rule_id=? ORDER BY evidence_id",
                         (group, definition.definition_id, memory_id),
                     ).fetchall()
-                ])
+                ]))
                 evidence = evidence_rows[0] if evidence_rows else {}
                 evidence_ref = _text(evidence.get("evidence_ref")) or _text(evidence.get("evidence_id"))
                 if not evidence_ref:
@@ -3093,6 +3263,9 @@ class NativeV2RuntimePort:
                     status="active",
                     include_building=False,
                 )
+                atoms = self._canonical_memory_rows(
+                    atoms, scope_public, suppress_rule_sources=False,
+                )
                 mandatory_atoms = [
                     atom for atom in atoms
                     if _text(getattr(atom, "injection_policy", "relevant")).casefold() == "always"
@@ -3154,7 +3327,7 @@ class NativeV2RuntimePort:
                     evidence_ids = list(getattr(memory, "evidence_ids_for_atom", lambda *_: [])(storage_atom_id) or [])
                     mappings = list(getattr(memory, "list_source_mappings", lambda **_: [])(atom_id=storage_atom_id) or [])
                     mapping = mappings[0] if mappings else {}
-                    memory_source_ids[memory_id] = {
+                    memory_source_ids[memory_id] = {memory_id} | {
                         _text(item.get("source_record_id"))
                         for item in mappings
                         if _text(item.get("source_record_id"))
@@ -6411,6 +6584,7 @@ class NativeV2RuntimePort:
                     "label": " ".join(body.split())[:96] or definition_id,
                     "body": body,
                     "status": status,
+                    "revision": rule.get("revision"),
                     "polarity": _text(rule.get("polarity")),
                     "rule_strength": _text(rule.get("rule_strength")),
                     "maturity_state": _text(rule.get("maturity_state")),
@@ -6833,7 +7007,10 @@ class NativeV2RuntimePort:
             raise NativePortError("admin_capability_required")
         provider = _text(payload.get("target_provider")).casefold()
         try:
-            from ..provider_adapters import ClaudeAdapter, CodexAdapter, CursorAdapter, TraeAdapter
+            from ..provider_adapters import (
+                ClaudeAdapter, CodexAdapter, CursorAdapter, TraeAdapter,
+                resolve_provider_binding,
+            )
 
             adapter_cls = {
                 "claude": ClaudeAdapter,
@@ -6843,14 +7020,22 @@ class NativeV2RuntimePort:
             }.get(provider)
             if adapter_cls is None:
                 raise NativePortError("unknown_provider")
+            control = self._group_service(write=True)
+            binding = resolve_provider_binding(control, provider)
             result = adapter_cls(self.workspace).install(
                 self.workspace,
-                share_group_id=_text(context.get("share_group_id")),
-                agent_instance_id=_text(context.get("agent_instance_id")),
+                share_group_id=_text(binding.get("share_group_id")),
+                agent_instance_id=_text(binding.get("agent_instance_id")),
                 global_scope=True,
             )
             if not isinstance(result, Mapping):
                 raise NativePortError("provider_install_failed")
+            from ..agent_mapping import normalize_program_identity
+            control.record_provider_identity(
+                normalize_program_identity(provider)["program_id"],
+                _text(binding.get("agent_instance_id")),
+                _text(binding.get("share_group_id")),
+            )
             # Do not expose absolute host config paths over the transport.
             return {
                 "provider": provider,
@@ -8160,6 +8345,79 @@ class NativeV2RuntimePort:
         except Exception as exc:
             raise NativePortError("v2_rule_exceptions_unavailable") from exc
 
+    def _gui_rule_body_update(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        """Edit the injected definition, retaining source evidence and versions."""
+        if not self._trusted_admin(context):
+            raise NativePortError("admin_capability_required")
+        definition_id = _text(payload.get("definition_id"))
+        body = _text(payload.get("body"))
+        expected = payload.get("expected_revision")
+        if not definition_id or not body:
+            raise NativePortError("rule_body_required")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            raise NativePortError("expected_revision_required")
+        from .mandatory_publication import snapshot, validate, MandatoryPublicationError
+        from ..rule_reconciliation import settle_native_canonical_snapshot
+
+        group = _text(context.get("share_group_id"))
+        store = self._domain_store("rules", write=True)
+        governance = self._governance_boundary()
+        try:
+            # Serialize against memory publications as well as rule writers.
+            with _native_memory_mutation_lock(self.workspace, group), governance.atomic_memory():
+                with store.transaction() as conn:
+                    definition = store.get_definition(definition_id)
+                    bindings = store.list_bindings(definition_id=definition_id)
+                    groups = {item.share_group_id for item in bindings}
+                    groups.update(str(row[0]) for row in conn.execute(
+                        "SELECT DISTINCT share_group_id FROM rule_source_links WHERE canonical_definition_id=?",
+                        (definition_id,),
+                    ))
+                    if group not in groups or definition is None:
+                        raise NativePortError("rule_definition_not_found")
+                    if groups != {group}:
+                        raise NativePortError("rule_shared_definition_requires_scoped_replacement")
+                    if definition.status != "active" or definition.superseded_by:
+                        raise NativePortError("rule_definition_not_active")
+                    if definition.revision != expected:
+                        raise NativePortError("revision_conflict")
+                    before = snapshot(self, context)
+                    old = definition.to_dict()
+                    store.record_definition_version(definition_id, snapshot=old,
+                        reason="GUI body edit", actor=_text(context.get("agent_instance_id")))
+                    store._update_composed_definition_conn(conn, definition, body)
+                    # Rule identity normalization is for hashes/search only;
+                    # injection must preserve the editor's readable claim.
+                    conn.execute("UPDATE rule_definitions SET canonical_text=?,text=? WHERE definition_id=?",
+                                 (body, body, definition_id))
+                    updated = store.get_definition(definition_id)
+                    after = updated.to_dict()
+                    decision_id = hashlib.sha256(_canonical_json({
+                        "action": "gui_rule_body_update", "group": group, "before": old, "after": after,
+                    }).encode("utf-8")).hexdigest()
+                    store.record_decision({
+                        "decision_id": decision_id, "rule_id": definition_id,
+                        "actor": _text(context.get("agent_instance_id")),
+                        "owner_agent_id": _text(context.get("agent_instance_id")),
+                        "action": "rule_body_update", "before_json": _canonical_json(old),
+                        "after_json": _canonical_json(after), "before_hash": definition.semantic_hash,
+                        "after_hash": updated.semantic_hash, "reason": "GUI body edit", "confidence": 1.0,
+                        "metadata_json": _canonical_json({"share_group_id": group}),
+                        "source_ref": "native-v2:gui:rule_body_update",
+                    })
+                    # Historical evidence digests refer to the historical sources;
+                    # the new claim is anchored by this immutable version/decision.
+                    settle_native_canonical_snapshot(self.workspace, group, store=store, reconcile=False)
+                    budget = validate(self, context, before, rules_store=store)
+            return {"ok": True, "definition_id": definition_id, "revision": updated.revision,
+                    "decision_id": decision_id, "budget": budget}
+        except MandatoryPublicationError as exc:
+            raise NativePortError(exc.code) from exc
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise self._map_governance_error(exc) from exc
+
     def _gui_rule_audience_update(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         if not self._trusted_admin(context):
             raise NativePortError("admin_capability_required")
@@ -8604,20 +8862,54 @@ class NativeV2RuntimePort:
             }
         return self._memory_status(payload, context, **kwargs)
 
+    def _runtime_lease_health(self) -> dict[str, Any]:
+        """Read-only split-brain probe for diagnostics.
+
+        A stale process from a previous build makes every write fail while the
+        manifest, domains and coverage all still look healthy, so doctor has to
+        report it as a first-class check rather than leaving it visible only in
+        an MCP error payload.
+        """
+        try:
+            from ..runtime_lease import runtime_lease_status, describe_split_brain
+
+            status = runtime_lease_status(self.workspace)
+            described = describe_split_brain(status, control_workspace=self.workspace)
+            return {
+                "split_brain": described["split_brain"],
+                "conflicting_pids": described["pids"],
+                "live": len(status.get("live") or []),
+                "stale": len(status.get("stale") or []),
+                "remedy": described["remedy"],
+            }
+        except Exception as exc:  # diagnostics must never break the command
+            return {"split_brain": False, "error": type(exc).__name__}
+
     def _cli_doctor(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
         if not context.get("share_group_id"):
-            return self._cli_workspace_health(
+            health = self._cli_workspace_health(
                 state=kwargs.get("state"), generation=kwargs.get("generation")
             )
+            return {**health, "runtime_lease": self._runtime_lease_health()}
         return {
             "status": "READY",
             "scope_status": "BOUND",
             "diagnostics": self._diagnostics_snapshot(payload, context, **kwargs),
+            "runtime_lease": self._runtime_lease_health(),
             "native_coverage": {
                 "counts": dict(self.coverage().get("counts") or {}),
                 "production_complete": bool(self.coverage().get("production_complete")),
             },
         }
+
+    def _cli_runtime(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        action = _text(payload.get("runtime_command")).casefold()
+        if action not in {"status", "reap"}:
+            raise NativePortError("invalid_runtime_action")
+        # Reaping terminates OS processes: admin capability, never ambient.
+        if action == "reap" and not self._trusted_admin(context):
+            raise NativePortError("admin_capability_required")
+        return self._cli_host_action("runtime")
 
     def _cli_gui(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         del payload, context
@@ -8708,6 +9000,7 @@ class NativeV2RuntimePort:
             "gui_rule_receipts": self._gui_rule_receipts,
             "gui_rule_exceptions": self._gui_rule_exceptions,
             "gui_rule_audience_update": self._gui_rule_audience_update,
+            "gui_rule_body_update": self._gui_rule_body_update,
             "binding_list": self._binding_list,
             "binding_create": self._binding_create,
             "rule_merge_capability_issue": lambda p, context, **k: self._rule_merge_operation("capability_issue", p, context, **k),
@@ -8793,6 +9086,7 @@ class NativeV2RuntimePort:
             "cli_groups": self._cli_groups,
             "cli_mcp_status": self._cli_mcp_status,
             "cli_doctor": self._cli_doctor,
+            "cli_runtime": self._cli_runtime,
             "cli_gui": self._cli_gui,
             "cli_open": self._cli_open,
             "cli_desktop": self._cli_desktop,

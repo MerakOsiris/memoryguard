@@ -79,7 +79,11 @@ class Transaction:
                 self._state = state
                 self._nested = True
                 return self.conn
-            self.conn.execute("BEGIN IMMEDIATE" if self.immediate else "BEGIN")
+        # BEGIN may wait for a different thread/process holding SQLite's
+        # writer lock.  Never hold the bookkeeping lock while waiting: that
+        # writer needs it to enter nested transactions and finish its commit.
+        self.conn.execute("BEGIN IMMEDIATE" if self.immediate else "BEGIN")
+        with _LOCK:
             state = _State(self.conn, owner=True)
             _STATES[key] = state
             self._state = state

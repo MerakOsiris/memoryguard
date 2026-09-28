@@ -628,7 +628,9 @@ def test_hook_stops_on_historical_mandatory_overflow(tmp_path):
         },
     )
     context = prompt_result["hookSpecificOutput"]["additionalContext"]
-    assert "强制规则包异常，停止继续执行" in context
+    assert "普通任务工具已阻断" in context
+    assert "memoryguard_memory_update（仅 preview=true）" in context
+    assert "停止继续执行" not in context
     denied = run_hook(
         provider="codex",
         event="pre_tool",

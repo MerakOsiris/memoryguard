@@ -72,6 +72,31 @@ def _conflict_reason_label(reason: str) -> str:
     return _CONFLICT_REASON_LABELS.get(raw.casefold(), _CONFLICT_REASON_LABELS.get(raw, _safe_preview(raw, limit=240)))
 
 
+def _ambiguous_member_ids(
+    stamped: Sequence[MemoryAtom],
+    buckets: Mapping[str, Sequence[MemoryAtom]],
+) -> set[str]:
+    """Ids whose bucket holds more than one atom. Unknown ids are not ambiguous."""
+    ids = {str(atom.memory_id) for atom in stamped if str(atom.memory_id or "").strip()}
+    for atom in stamped:
+        ids.update(_peer_ids(dict(atom.metadata or {})))
+    return {
+        member_id for member_id in ids
+        if len(buckets.get(member_id, ())) > 1
+    }
+
+
+def _peer_ids(metadata: Mapping[str, Any]) -> set[str]:
+    found: set[str] = set()
+    for key in ("conflict_peer_ids", "conflict_member_ids", "member_ids"):
+        peers = metadata.get(key)
+        if isinstance(peers, str):
+            peers = [peers]
+        if isinstance(peers, (list, tuple, set)):
+            found.update(str(peer).strip() for peer in peers if str(peer).strip())
+    return found
+
+
 def _conflict_member_state(status: str, *, available: bool) -> tuple[bool, str]:
     normalized = str(status or "missing").strip().casefold() or "missing"
     if not available:
@@ -226,6 +251,91 @@ class GovernanceNativeService:
             include_building=True,
         )
 
+    def _caller_read_scope(self, trusted: Mapping[str, Any]) -> MemoryReadScope | None:
+        """Scope matching memory_read for this caller.
+
+        Group-plane listing already returns every admin-visible atom. A
+        non-admin memory_read still uses the caller agent. Conflict snapshots
+        must see those same rows, and must not see another agent's audience.
+        """
+        if bool(trusted.get("admin") or trusted.get("is_admin")):
+            return None
+        agent = str(trusted.get("agent_instance_id") or "").strip()
+        project = str(trusted.get("project_ref") or "").strip()
+        provider = str(trusted.get("provider") or "").strip()
+        runtime = str(trusted.get("runtime_role") or "").strip()
+        group = str(trusted.get("share_group_id") or "").strip()
+        if not group or not any((agent, project, provider, runtime)):
+            return None
+        return MemoryReadScope(
+            workspace_id=str(self.workspace),
+            share_group_id=group,
+            agent_instance_id=agent,
+            project_ref=project,
+            provider=provider,
+            runtime_role=runtime,
+            admin=False,
+        )
+
+    def _conflict_sources(
+        self, trusted: Mapping[str, Any],
+    ) -> tuple[list[MemoryAtom], dict[str, list[MemoryAtom]]]:
+        atoms = list(self._atoms(trusted))
+        scope = self._caller_read_scope(trusted)
+        if scope is not None and self._memory_db_path.is_file():
+            seen = {atom.atom_id for atom in atoms}
+            for atom in self._memory().list_atoms(scope=scope, include_building=True):
+                if atom.atom_id not in seen:
+                    atoms.append(atom)
+                    seen.add(atom.atom_id)
+        buckets: dict[str, list[MemoryAtom]] = {}
+        for atom in atoms:
+            for key in (str(atom.memory_id or "").strip(), str(atom.atom_id or "").strip()):
+                if not key:
+                    continue
+                found = buckets.setdefault(key, [])
+                if all(item.atom_id != atom.atom_id for item in found):
+                    found.append(atom)
+        return atoms, buckets
+
+    def _conflict_membership(
+        self, trusted: Mapping[str, Any], group_id: str,
+    ) -> tuple[list[MemoryAtom], list[MemoryAtom], dict[str, list[MemoryAtom]]] | None:
+        """Stamped rows of this group, plus unique in-scope peers.
+
+        A peer that still belongs to another group is visible for the live
+        count and the audit list.  It is not a row this group may rewrite.
+        Several atoms sharing one memory_id are ambiguous: none is chosen.
+        """
+        atoms, buckets = self._conflict_sources(trusted)
+        stamped: list[MemoryAtom] = []
+        peer_ids: set[str] = set()
+        seen: set[str] = set()
+        for atom in atoms:
+            metadata = dict(atom.metadata or {})
+            if str(metadata.get("conflict_group_id") or "").strip() != group_id:
+                continue
+            if atom.atom_id in seen:
+                continue
+            seen.add(atom.atom_id)
+            stamped.append(atom)
+            peer_ids.update(_peer_ids(metadata))
+        if not stamped:
+            return None
+        referenced: list[MemoryAtom] = []
+        for member_id in sorted(peer_ids):
+            matches = [item for item in buckets.get(member_id, ()) if item.atom_id not in seen]
+            unique: list[MemoryAtom] = []
+            for item in matches:
+                if any(existing.atom_id == item.atom_id for existing in unique):
+                    continue
+                unique.append(item)
+            if len(unique) != 1:
+                continue
+            referenced.append(unique[0])
+            seen.add(unique[0].atom_id)
+        return stamped, referenced, buckets
+
     def _find_atom(self, identifier: str, trusted: Mapping[str, Any]) -> MemoryAtom:
         value = str(identifier or "").strip()
         if not value:
@@ -330,7 +440,7 @@ class GovernanceNativeService:
         compatibility import.  The atom body is already retained by the V2
         tombstone path; only a bounded redacted preview crosses this API.
         """
-        atoms = self._atoms(trusted)
+        atoms, buckets = self._conflict_sources(trusted)
         groups: dict[str, dict[str, Any]] = {}
         for atom in atoms:
             metadata = dict(atom.metadata or {})
@@ -340,17 +450,10 @@ class GovernanceNativeService:
             group = groups.setdefault(group_id, {"atoms": {}, "member_ids": set()})
             group["atoms"][atom.memory_id] = atom
             group["member_ids"].add(atom.memory_id)
-            # New organizer rows stamp conflict_peer_ids.  Accept the older
-            # aliases as a compatibility seam, but never use arbitrary body
-            # text or records outside this trusted read scope.
-            for key in ("conflict_peer_ids", "conflict_member_ids", "member_ids"):
-                peers = metadata.get(key)
-                if isinstance(peers, str):
-                    peers = [peers]
-                if isinstance(peers, (list, tuple, set)):
-                    group["member_ids"].update(
-                        str(peer).strip() for peer in peers if str(peer).strip()
-                    )
+            # Organizer stamps memory_id peers. Older rows may store an
+            # atom_id. Resolve either against in-scope atoms. An unknown id
+            # stays missing; do not chase a successor or another agent's row.
+            group["member_ids"].update(_peer_ids(metadata))
 
         result = []
         for group_id, grouped in sorted(groups.items()):
@@ -373,15 +476,51 @@ class GovernanceNativeService:
             raw_reason = str(metadata.get("conflict_reason") or "conflicting governed memory records").strip()
             member_ids = sorted(grouped["member_ids"])
             member_details = []
+            shown_ids: list[str] = []
+            seen_atoms: set[str] = set()
             for memory_id in member_ids:
-                atom = group_atoms.get(memory_id)
+                matches: list[MemoryAtom] = []
+                for item in buckets.get(memory_id, ()):
+                    if any(existing.atom_id == item.atom_id for existing in matches):
+                        continue
+                    matches.append(item)
+                if len(matches) > 1:
+                    shown_ids.append(memory_id)
+                    member_details.append({
+                        "memory_id": memory_id,
+                        "body": "",
+                        "preview": "",
+                        "body_preview": "",
+                        "kind": "",
+                        "status": "ambiguous",
+                        "selectable": False,
+                        "live": False,
+                        "available": False,
+                        "missing": False,
+                        "history_available": False,
+                        "snapshot_status": "snapshot_unavailable",
+                        "reason": "同一 memory_id 对应多条原子，不能选择其中一条删除",
+                        "revision": None,
+                        "created_at": "",
+                        "updated_at": "",
+                    })
+                    continue
+                atom = matches[0] if matches else None
+                if atom is not None:
+                    if atom.atom_id in seen_atoms:
+                        continue
+                    seen_atoms.add(atom.atom_id)
+                    shown_id = str(atom.memory_id or memory_id)
+                else:
+                    shown_id = memory_id
+                shown_ids.append(shown_id)
                 available = atom is not None
                 member_status = str(atom.status if atom is not None else "missing").strip().casefold() or "missing"
                 selectable, member_reason = _conflict_member_state(member_status, available=available)
                 body = str(atom.body or "") if atom is not None else ""
                 preview = _safe_preview(body)
                 member_details.append({
-                    "memory_id": memory_id,
+                    "memory_id": shown_id,
                     # ``body`` is intentionally the same bounded, redacted
                     # preview; the raw atom body never crosses this seam.
                     "body": preview,
@@ -408,6 +547,10 @@ class GovernanceNativeService:
             invalid_reason = "" if can_resolve else (
                 "冲突成员已失效或缺失；至少需要 2 条仍有效的记忆才能解决。"
             )
+            if _ambiguous_member_ids(list(group_atoms.values()), buckets):
+                can_resolve = False
+                status = "ambiguous"
+                invalid_reason = "同一 memory_id 对应多条原子，不能解决或关闭。"
             created_candidates = [
                 str(item.get("conflict_created_at") or item.get("created_at") or "")
                 for item in metadata_values
@@ -415,7 +558,7 @@ class GovernanceNativeService:
             created_candidates = [item for item in created_candidates if item]
             result.append({
                 "group_id": group_id,
-                "member_ids": member_ids,
+                "member_ids": shown_ids,
                 "members": member_details,
                 "member_details": member_details,
                 "live_member_count": live_count,
@@ -521,8 +664,9 @@ class GovernanceNativeService:
         metadata: Mapping[str, Any] | None = None,
         reason: str,
         operation_key: str,
+        governance: Any | None = None,
     ) -> tuple[MemoryAtom, Any]:
-        governance = self._governance()
+        governance = governance or self._governance()
         ctx = self._context(self.workspace, trusted)
         updated = replace(
             atom,
@@ -556,14 +700,16 @@ class GovernanceNativeService:
         # capability before touching the conflict/group namespace so an
         # unprivileged caller cannot use lookup results as an oracle.
         self._require_admin(trusted)
-        all_group_atoms = [
-            atom for atom in self._atoms(trusted)
-            if str((atom.metadata or {}).get("conflict_group_id") or "") == group
-        ]
-        members = [atom for atom in all_group_atoms if atom.status in _CONFLICT_LIVE_STATUSES]
-        keeper = next((atom for atom in members if atom.memory_id == keep), None)
-        if not all_group_atoms:
+        membership = self._conflict_membership(trusted, group)
+        if membership is None:
             raise GovernanceNativeError("conflict_group_not_found")
+        stamped, referenced, buckets = membership
+        if _ambiguous_member_ids(stamped, buckets):
+            raise GovernanceNativeError("conflict_member_ambiguous")
+        live_stamped = [atom for atom in stamped if atom.status in _CONFLICT_LIVE_STATUSES]
+        live_referenced = [atom for atom in referenced if atom.status in _CONFLICT_LIVE_STATUSES]
+        members = live_stamped + live_referenced
+        keeper = next((atom for atom in members if atom.memory_id == keep), None)
         if keeper is None or len(members) < 2:
             # Match the read surface: stale groups are visible for audit, but
             # their historical IDs may never be used to trigger a mutation.
@@ -572,54 +718,69 @@ class GovernanceNativeService:
         # conflict resolution must never silently tombstone it.  Keep this
         # check before creating a decision or mutating any member so an absent
         # or rejected confirmation is fully fail-closed.
+        keeper_stamped = any(atom.atom_id == keeper.atom_id for atom in stamped)
+        losers = [
+            atom for atom in (*live_stamped, *live_referenced)
+            if atom.atom_id != keeper.atom_id
+        ]
         protected_losers = [
             atom.memory_id
-            for atom in members
-            if atom.atom_id != keeper.atom_id
-            and str(atom.injection_policy or "").strip().casefold() == "always"
+            for atom in losers
+            if str(atom.injection_policy or "").strip().casefold() == "always"
         ]
         if protected_losers and confirmed is not True:
             raise GovernanceNativeError("conflict_always_rule_protected")
         governance = self._governance()
         ctx = self._context(self.workspace, trusted)
         decisions: list[str] = []
+        deleted: list[str] = []
         try:
-            # Delete losing members first because tombstones have a guarded
-            # compensating undo.  Update the keeper only after every reversible
-            # destructive step succeeds; GovernanceV2 intentionally does not
-            # offer a generic put/update undo.
-            deleted: list[str] = []
-            for atom in members:
-                if atom.atom_id == keeper.atom_id:
-                    continue
-                _removed, decision = governance.tombstone(
-                    atom.memory_id,
-                    context=ctx,
-                    reason=f"resolve conflict {group}: superseded by {keeper.memory_id}",
-                    confidence=1.0,
-                    idempotency_key=f"conflict:{group}:delete:{atom.atom_id}:{atom.revision}",
-                )
-                decisions.append(decision.decision_id)
-                deleted.append(atom.memory_id)
-            keeper_meta = dict(keeper.metadata or {})
-            keeper_meta["conflict_status"] = "resolved"
-            keeper_meta["conflict_resolution"] = "kept"
-            _persisted, decision = self._update_atom(
-                keeper,
-                trusted,
-                metadata=keeper_meta,
-                reason="resolve conflict: keep selected memory",
-                operation_key=f"conflict:{group}:keep:{keeper.atom_id}:{keeper.revision}",
-            )
-            decisions.append(decision.decision_id)
+            # put_atom has no undo. One publication transaction covers the
+            # resolved mark, every loser tombstone, and the keeper update.
+            with governance.atomic_memory():
+                for atom in losers:
+                    stamped_loser = any(item.atom_id == atom.atom_id for item in stamped)
+                    if stamped_loser and not keeper_stamped:
+                        # Tombstone copies metadata. Mark this group's row
+                        # resolved first so the queue clears without rewriting
+                        # the external peer's old group.
+                        meta = dict(atom.metadata or {})
+                        meta["conflict_status"] = "resolved"
+                        meta["conflict_resolution"] = "kept_peer"
+                        atom, decision = self._update_atom(
+                            atom,
+                            trusted,
+                            metadata=meta,
+                            reason=f"resolve conflict {group}: keep peer {keeper.memory_id}",
+                            operation_key=f"conflict:{group}:resolve-stamped:{atom.atom_id}:{atom.revision}",
+                            governance=governance,
+                        )
+                        decisions.append(decision.decision_id)
+                    _removed, decision = governance.tombstone(
+                        atom.memory_id,
+                        context=ctx,
+                        reason=f"resolve conflict {group}: superseded by {keeper.memory_id}",
+                        confidence=1.0,
+                        idempotency_key=f"conflict:{group}:delete:{atom.atom_id}:{atom.revision}",
+                    )
+                    decisions.append(decision.decision_id)
+                    deleted.append(atom.memory_id)
+                if keeper_stamped:
+                    keeper_meta = dict(keeper.metadata or {})
+                    keeper_meta["conflict_status"] = "resolved"
+                    keeper_meta["conflict_resolution"] = "kept"
+                    _persisted, decision = self._update_atom(
+                        keeper,
+                        trusted,
+                        metadata=keeper_meta,
+                        reason="resolve conflict: keep selected memory",
+                        operation_key=f"conflict:{group}:keep:{keeper.atom_id}:{keeper.revision}",
+                        governance=governance,
+                    )
+                    decisions.append(decision.decision_id)
+        except GovernanceNativeError:
+            raise
         except Exception as exc:
-            for decision_id in reversed(decisions):
-                try:
-                    governance.undo(decision_id, context=ctx, reason="compensate failed conflict resolution")
-                except Exception:
-                    pass
-            if isinstance(exc, GovernanceNativeError):
-                raise
             raise GovernanceNativeError("conflict_resolution_failed") from exc
         return {
             "ok": True,
@@ -648,33 +809,30 @@ class GovernanceNativeService:
             raise GovernanceNativeError("conflict_group_id_required")
         self._require_admin(trusted)
 
-        all_group_atoms = [
-            atom for atom in self._atoms(trusted)
-            if str((atom.metadata or {}).get("conflict_group_id") or "") == group
-        ]
-        if not all_group_atoms:
+        membership = self._conflict_membership(trusted, group)
+        if membership is None:
             raise GovernanceNativeError("conflict_group_not_found")
-        live_members = [
-            atom for atom in all_group_atoms
-            if atom.status in _CONFLICT_LIVE_STATUSES
-        ]
-        if len(live_members) >= 2:
+        stamped, referenced, buckets = membership
+        if _ambiguous_member_ids(stamped, buckets):
+            raise GovernanceNativeError("conflict_member_ambiguous")
+        live_stamped = [atom for atom in stamped if atom.status in _CONFLICT_LIVE_STATUSES]
+        live_referenced = [atom for atom in referenced if atom.status in _CONFLICT_LIVE_STATUSES]
+        if len(live_stamped) + len(live_referenced) >= 2:
             raise GovernanceNativeError("conflict_group_actionable")
-
-        # Prefer the remaining live member as the visible anchor.  If every
-        # member is stale, the newest revision is deterministic and still
-        # carries the historical conflict metadata.
-        if live_members:
+        # Closure is written only onto this group's stamped rows. A referenced
+        # peer can make the group actionable, and is recorded for audit, but
+        # its own group metadata is left untouched.
+        if live_stamped:
             anchor = max(
-                live_members,
+                live_stamped,
                 key=lambda atom: (int(atom.revision), str(atom.updated_at), atom.memory_id),
             )
         else:
             anchor = max(
-                all_group_atoms,
+                stamped,
                 key=lambda atom: (int(atom.revision), str(atom.updated_at), atom.memory_id),
             )
-        member_ids = sorted({atom.memory_id for atom in all_group_atoms})
+        member_ids = sorted({atom.memory_id for atom in stamped} | {atom.memory_id for atom in referenced})
         anchor_meta = dict(anchor.metadata or {})
         anchor_meta.update({
             "conflict_status": "resolved",

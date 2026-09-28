@@ -456,6 +456,14 @@ def governance_scope_key(
             target_id = project
         elif target_type == "group":
             target_id = group
+    # Native audience types are the full read contract.  Owner provenance
+    # (project/provider/runtime) must not split one agent/group rule into a
+    # new dedup domain whenever the same owner changes tasks or models.
+    if audience.get("source") == "native_v2":
+        if target_type in {"agent", "group"}:
+            project = ""
+        if target_type in {"agent", "agent_project", "project", "group"}:
+            provider_value = runtime = ""
     return target_type, target_id, group, project, provider_value, runtime, effect
 
 

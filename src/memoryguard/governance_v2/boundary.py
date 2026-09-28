@@ -7,6 +7,7 @@ keeps a compact, body-free decision ledger for compensating undo.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -90,8 +91,28 @@ class V2GovernanceBoundary:
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_ledger()
 
+    def _connect_ledger(self, *, timeout: float = 30.0) -> sqlite3.Connection:
+        from .atomic import ledger_connection
+
+        return ledger_connection(self.ledger_path) or sqlite3.connect(self.ledger_path, timeout=timeout)
+
+    @contextmanager
+    def atomic_memory(self):
+        """Keep related mutations, publication and their receipts indivisible."""
+        from .atomic import memory_publication
+
+        with memory_publication(self.memory.db_path, self.ledger_path, self.evidence.db_path) as owner:
+            yield owner
+
     def _init_ledger(self) -> None:
-        conn = sqlite3.connect(self.ledger_path, timeout=30.0)
+        from .atomic import ledger_connection
+
+        # The publication owner already initialized the attached ledger.
+        # Unqualified CREATE TABLE on its borrowed connection would create
+        # shadow ledger tables in the memory database instead.
+        if ledger_connection(self.ledger_path) is not None:
+            return
+        conn = self._connect_ledger()
         try:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY,operation TEXT NOT NULL,target_json TEXT NOT NULL,reason TEXT NOT NULL,confidence REAL NOT NULL,undo_hash TEXT NOT NULL,context_json TEXT NOT NULL,before_json TEXT NOT NULL,after_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,idempotency_key TEXT NOT NULL DEFAULT '',request_fingerprint TEXT NOT NULL DEFAULT '')"
@@ -211,7 +232,7 @@ class V2GovernanceBoundary:
         return key, fingerprint
 
     def _find_request(self, context: V2MutationContext, operation: str, key: str, fingerprint: str) -> V2Decision | None:
-        conn = sqlite3.connect(self.ledger_path)
+        conn = self._connect_ledger()
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
@@ -243,7 +264,7 @@ class V2GovernanceBoundary:
         deadline = time.monotonic() + 2.0
         while True:
             token = secrets.token_hex(16)
-            conn = sqlite3.connect(self.ledger_path, timeout=30.0)
+            conn = self._connect_ledger()
             conn.row_factory = sqlite3.Row
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -290,7 +311,7 @@ class V2GovernanceBoundary:
     def _fail_request(self, context: V2MutationContext, claim: _RequestClaim, code: str = "request_failed") -> None:
         """Seal a handled failure; unhandled process crashes stay claimed."""
 
-        conn = sqlite3.connect(self.ledger_path, timeout=30.0)
+        conn = self._connect_ledger()
         try:
             conn.execute("BEGIN IMMEDIATE")
             changed = conn.execute(
@@ -349,7 +370,7 @@ class V2GovernanceBoundary:
         undo_hash = _digest({"operation": operation, "target": dict(target), "before": dict(before), "after": dict(after)})
         decision_id = _digest({"operation": operation, "actor": context.actor, "workspace_id": context.workspace_id, "share_group_id": context.share_group_id, "idempotency_key": str(idempotency_key)})
         now = _now()
-        conn = sqlite3.connect(self.ledger_path, timeout=30.0)
+        conn = self._connect_ledger()
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
@@ -840,7 +861,7 @@ class V2GovernanceBoundary:
         return removed, decision
 
     def list_decisions(self) -> list[V2Decision]:
-        conn = sqlite3.connect(self.ledger_path)
+        conn = self._connect_ledger()
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute("SELECT * FROM decisions ORDER BY created_at, decision_id").fetchall()
@@ -885,7 +906,7 @@ class V2GovernanceBoundary:
             result = self._record("undo", target, ctx, {"old": old_before, "new": new_before}, {"old": self._atom_snapshot(old), "new": self._atom_snapshot(new)}, reason=reason, confidence=confidence)
         else:
             raise V2GovernanceError(f"undo is not supported for {decision.operation}")
-        conn = sqlite3.connect(self.ledger_path)
+        conn = self._connect_ledger()
         try:
             conn.execute("UPDATE decisions SET status=? WHERE decision_id=? AND status='applied'", ("compensated", decision.decision_id))
             conn.commit()

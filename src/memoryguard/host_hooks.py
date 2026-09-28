@@ -1344,7 +1344,8 @@ class CursorHookAdapter(HostHookAdapter):
                     share_group_id,
                     runtime_python=runtime_python,
                 ),
-                "timeout": 15,
+                # Cursor deadline includes host shell startup and queueing.
+                "timeout": 30,
             }
             if event == "pre_tool":
                 entry["failClosed"] = True
@@ -2544,6 +2545,30 @@ def _normalized_strings(value: Any) -> list[str]:
 def _targets_native_memory(tool_name: str, tool_input: Any) -> bool:
     normalized_tool = (tool_name or "").casefold()
     strings = _normalized_strings(tool_input)
+    if "apply_patch" in normalized_tool:
+        # Source text is not a destination. Inspect every patch file header,
+        # including move targets, without treating example paths as writes.
+        headers = [
+            match.group(1).strip()
+            for value in _flatten_strings(tool_input)
+            for match in re.finditer(
+                r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$",
+                value, re.MULTILINE,
+            )
+        ]
+        if headers:
+            strings = _normalized_strings(headers)
+    elif any(token in normalized_tool for token in ("write", "edit", "delete")):
+        mapping = _coerce_mapping(tool_input)
+        paths = [
+            mapping[key] for key in (
+                "path", "file_path", "filepath", "target_file", "paths",
+                "old_path", "new_path", "source", "destination",
+            ) if key in mapping
+        ]
+        if paths:
+            strings = _normalized_strings(paths)
+    strings = ["/" + value.lstrip("/") for value in strings]
     if not any(
         pattern.search(value)
         for value in strings
@@ -2879,14 +2904,64 @@ def _budget_count_warning_message(packet: Mapping[str, Any] | None) -> str:
     return ""
 
 
+_BUDGET_RECOVERY_OPERATIONS = frozenset({
+    "context_bootstrap",
+    "memory_status", "memory_search", "memory_read",
+    "canonical_status", "projection_status", "diagnostics_snapshot", "runtime_processes",
+    "audit", "explain", "semantic_check", "list_sources", "binding_list",
+    "rule_scope_stats", "rule_decision_read",
+})
+
+
+def _tool_matches_operation(tool_name: str, tool_input: Any, operation: str) -> bool:
+    return _is_memoryguard_tool(tool_name, operation) or bool(
+        _cursor_mcp_inner_tool_name(tool_name, tool_input, operation=operation)
+    )
+
+
+def _is_update_preview(tool_input: Any) -> bool:
+    """True only for an explicit non-committing memory_update preview."""
+    mapping = _coerce_mapping(tool_input)
+    candidates = [mapping, _coerce_mapping(mapping.get("arguments"))]
+    return any(item.get("preview") is True for item in candidates)
+
+
+def _is_budget_recovery_tool(tool_name: str, tool_input: Any = None) -> bool:
+    """Tools that stay reachable while the mandatory package is over budget.
+
+    Ordinary task tools stay blocked. Committing writes, deletes, and merge
+    approvals stay blocked too. Diagnostics, reads, update preview, and
+    bootstrap remain so a bound agent can inspect and re-bootstrap after the
+    host finishes controlled governance.
+    """
+    for operation in _BUDGET_RECOVERY_OPERATIONS:
+        if _tool_matches_operation(tool_name, tool_input, operation):
+            return True
+    return _tool_matches_operation(
+        tool_name, tool_input, "memory_update"
+    ) and _is_update_preview(tool_input)
+
+
+def _mandatory_overflow_block_message(reason: str = "") -> str:
+    detail = str(reason or "").strip() or "mandatory_budget_exceeded"
+    return (
+        "MemoryGuard 强制规则包超出预算，普通任务工具已阻断。"
+        f"原因：{detail}。"
+        "仍允许：memoryguard_context_bootstrap、"
+        "memoryguard_memory_read、memoryguard_memory_search、memoryguard_memory_status、"
+        "memoryguard_audit、memoryguard_explain、memoryguard_diagnostics_snapshot、"
+        "memoryguard_memory_update（仅 preview=true）。"
+        "普通任务工具保持阻断，直到受控治理完成且真实 bootstrap 成功。"
+    )
+
+
 def _render_context(packet: dict[str, Any]) -> str:
     context_packet = packet.get("context_packet", {})
     items = context_packet.get("items", [])
     mandatory_items = context_packet.get("mandatory_items", [])
     if packet.get("mandatory_overflow"):
-        return (
-            "MemoryGuard 强制规则包异常，停止继续执行。"
-            f"原因：{packet.get('error') or 'mandatory_rule_package_invalid'}"
+        return _mandatory_overflow_block_message(
+            str(packet.get("error") or packet.get("mandatory_invalid_reason") or "")
         )
     lines = [
         "[MemoryGuard 强制规则（必须遵循）]",
@@ -3238,6 +3313,43 @@ def _hook_data(result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             if key in data
         }
     return data, packet if isinstance(packet, dict) else {}
+
+
+def _verified_bootstrap_packet(result: Any, agent_instance_id: str) -> dict[str, Any] | None:
+    """Require semantic V2 bootstrap success before clearing mandatory debt.
+
+    A transport's isError=false (or a bare ok=true) does not prove that its
+    context package passed validation. Only a complete response from the
+    explicitly identified bootstrap operation for this bound agent does.
+    """
+    if not isinstance(result, dict) or result.get("isError") is True or result.get("ok") is False:
+        return None
+    if result.get("name") == "memoryguard_context_bootstrap" and result.get("ok") is True:
+        packet = result.get("data")
+        if (
+            isinstance(packet, dict)
+            and packet.get("status") == "ok" and not packet.get("error")
+            and packet.get("state") == "V2_ACTIVE" and packet.get("ready") is True
+            and not packet.get("mandatory_overflow") and not packet.get("mandatory_invalid_reason")
+            and packet.get("effective_agent") == agent_instance_id
+            and isinstance(packet.get("mandatory"), list)
+            and isinstance(packet.get("receipts"), list)
+            and isinstance(packet.get("budget"), dict)
+            and isinstance(packet["budget"].get("mandatory"), dict)
+        ):
+            return packet
+        return None
+    content = result.get("content")
+    if isinstance(content, list):
+        # MCP returns one JSON text payload. Reject ambiguity instead of
+        # selecting a successful fragment from a mixed/error response.
+        texts = [item.get("text") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+        if len(texts) == 1 and isinstance(texts[0], str):
+            try:
+                return _verified_bootstrap_packet(json.loads(texts[0]), agent_instance_id)
+            except (ValueError, TypeError):
+                pass
+    return None
 
 
 _MANDATORY_FAIL_CLOSED_ERRORS = frozenset({
@@ -4004,7 +4116,9 @@ def _v2_hook_cutover(
             if overflow:
                 return _deny_output(
                     provider,
-                    "MemoryGuard mandatory rule package overflow; tool execution denied.",
+                    _mandatory_overflow_block_message(
+                        str(packet.get("error") or packet.get("mandatory_invalid_reason") or "")
+                    ),
                 )
 
     heartbeat_overflow = bool(
@@ -4141,6 +4255,19 @@ def _run_hook_unlocked(
     # never included here and remains fail-closed.
     if event == "pre_tool":
         recovery_tool, recovery_input = _hook_tool_parts(payload)
+        overflow_state = _load_state(root, normalized_provider, session_id)
+        if overflow_state.get("mandatory_overflow") and mode == "enforce":
+            if not _is_budget_recovery_tool(recovery_tool, recovery_input):
+                return _deny_output(
+                    normalized_provider,
+                    _mandatory_overflow_block_message(
+                        str(
+                            overflow_state.get("mandatory_invalid_reason")
+                            or overflow_state.get("bootstrap_error")
+                            or ""
+                        )
+                    ),
+                )
         if _is_memoryguard_recovery_tool(recovery_tool, recovery_input):
             # The recovery lane intentionally bypasses the V2 hook dispatch,
             # but a real Cursor CallMcpTool bootstrap must still satisfy the
@@ -4182,7 +4309,9 @@ def _run_hook_unlocked(
                 elif prior_state.get("mandatory_overflow"):
                     return _deny_output(
                         normalized_provider,
-                        "MemoryGuard mandatory rule package overflow; tool execution denied.",
+                        _mandatory_overflow_block_message(
+                            str(prior_state.get("mandatory_invalid_reason") or prior_state.get("bootstrap_error") or "")
+                        ),
                     )
                 else:
                     return _deny_output(
@@ -4215,7 +4344,9 @@ def _run_hook_unlocked(
                 if current_state.get("mandatory_overflow"):
                     return _deny_output(
                         normalized_provider,
-                        "MemoryGuard 强制规则包异常，停止继续执行。请先修复共享记忆中的强制规则。",
+                        _mandatory_overflow_block_message(
+                            str(current_state.get("mandatory_invalid_reason") or current_state.get("bootstrap_error") or "")
+                        ),
                     )
                 return _deny_output(
                     normalized_provider,
@@ -4251,7 +4382,9 @@ def _run_hook_unlocked(
         if state.get("mandatory_overflow") and mode == "enforce":
             return _deny_output(
                 normalized_provider,
-                "MemoryGuard 强制规则包异常，停止继续执行。请先修复共享记忆中的强制规则。",
+                _mandatory_overflow_block_message(
+                    str(state.get("mandatory_invalid_reason") or state.get("bootstrap_error") or "")
+                ),
             )
         if state.get("bootstrap_error") and mode == "enforce":
             return _deny_output(
@@ -4306,6 +4439,25 @@ def _run_hook_unlocked(
             if _is_memoryguard_bootstrap(tool_name, tool_input):
                 success, reason = _coerce_tool_result_status(tool_result)
                 state["bootstrap_pending"] = False
+                verified_packet = _verified_bootstrap_packet(tool_result, agent_instance_id)
+                package_clear = (
+                    success is True
+                    and verified_packet is not None
+                    and not _is_mandatory_overflow_error(
+                        verified_packet.get("error"), verified_packet
+                    )
+                )
+                if package_clear:
+                    normalized = _normalize_native_v2_packet(
+                        verified_packet, workspace=root, provider=normalized_provider,
+                        agent_instance_id=agent_instance_id, share_group_id=share_group_id,
+                        session_id=session_id, event="post_tool",
+                    )
+                    state["mandatory_overflow"] = False
+                    state["mandatory_invalid_reason"] = ""
+                    state["mandatory_rule_ids"] = list(normalized.get("mandatory_rule_ids") or [])
+                    state["mandatory_match_receipts"] = list(normalized.get("mandatory_match_receipts") or [])
+                    state["context_hash"] = _short_hash(json.dumps(verified_packet, sort_keys=True, ensure_ascii=False))
                 if success is True and not state.get("mandatory_overflow"):
                     state["bootstrap_ok"] = True
                     state["bootstrap_error"] = ""
@@ -4465,20 +4617,44 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         sys.stdout.write(json.dumps(result, ensure_ascii=False))
         return 0
-    except Exception as exc:
+    except BaseException as exc:  # noqa: BLE001 - a hook must never exit silently
+        # BaseException, not Exception: a SystemExit raised deeper in the runtime
+        # escaped this handler and left stdout empty.  The host reports that as
+        # "hook returned no output" and, being fail-closed, blocks the tool with
+        # no reason attached — which is indistinguishable from a hang.
+        if isinstance(exc, SystemExit) and not exc.code:
+            raise
+
+        reason = f"MemoryGuard Hook 执行失败，已阻止本次工具调用：{exc}"
+        try:
+            from .runtime_lease import split_brain_hint
+
+            hint = split_brain_hint(args.workspace)
+            if hint.get("split_brain"):
+                reason = (
+                    hint["summary"]
+                    + "\n最常见成因：升级后旧版本进程没有退出。"
+                    + "\n修复：" + hint["remedy"] + "（或结束这些进程后重启宿主）"
+                )
+        except BaseException:
+            pass
+
         # PreToolUse is the only fail-closed runtime event.  Other failures
         # surface through status/heartbeat without bricking the host session.
         if args.event == "pre_tool":
             try:
-                result = _deny_output(
-                    args.provider,
-                    f"MemoryGuard Hook 执行失败，已阻止本次工具调用：{exc}",
+                sys.stdout.write(
+                    json.dumps(_deny_output(args.provider, reason), ensure_ascii=False)
                 )
-                sys.stdout.write(json.dumps(result, ensure_ascii=False))
-            except Exception:
-                sys.stdout.write("{}")
+            except BaseException:
+                # Last resort still denies.  Writing "{}" here would read as
+                # allow and silently disarm the gate on the very path that
+                # exists because something already went wrong.
+                sys.stdout.write(
+                    json.dumps(_deny_output(args.provider, "MemoryGuard Hook 失败，已阻止本次工具调用"))
+                )
             return 0
-        sys.stderr.write(f"memoryguard hook error: {exc}\n")
+        sys.stderr.write(f"memoryguard hook error: {reason}\n")
         return 1
 
 
