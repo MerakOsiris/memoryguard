@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.14] - 2026-09-28
+
+### Changed
+
+- Synchronized the MCP server namespace and repository metadata after the
+  GitHub repository rename. Runtime behavior is unchanged.
+
 ## [0.7.13] - 2026-09-28
 
 ### Changed

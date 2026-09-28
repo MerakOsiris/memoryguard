@@ -1,6 +1,6 @@
 <h1 align="center">MemoryGuard</h1>
 
-<!-- mcp-name: io.github.irisxc4/memoryguard -->
+<!-- mcp-name: io.github.MerakOsiris/memoryguard -->
 
 <p align="center">
   <strong>面向编程 Agent 的受治理共享记忆。</strong><br />
@@ -57,6 +57,9 @@ MCP name：`io.github.irisxc4/memoryguard`。
 
 详见 [v0.7.12 发布说明](docs/releases/v0.7.12.md) 与
 [更新日志](CHANGELOG.md)。
+
+v0.7.14 仅修正 GitHub 仓库更名后的发布元数据，不改变运行功能，见
+[v0.7.14 发布说明](docs/releases/v0.7.14.md)。
 
 更早版本的细节请见[更新日志](CHANGELOG.md)和
 [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)。
@@ -148,10 +151,10 @@ flowchart TB
 
 ### MCP Registry 元数据
 
-本包以 `io.github.irisxc4/memoryguard` 提供本地 stdio MCP 服务，注册表元数据见
+本包以 `io.github.MerakOsiris/memoryguard` 提供本地 stdio MCP 服务，注册表元数据见
 [`server.json`](server.json)。上方 marker 随 PyPI 包 README 一并发布；发布由 GitHub
 OIDC 推送至 PyPI 和官方 MCP Registry。请以公开页面实时核验当前包版本与
-`io.github.irisxc4/memoryguard` 的 active/latest 状态。
+`io.github.MerakOsiris/memoryguard` 的 active/latest 状态。
 
 ### 1. 安装
 

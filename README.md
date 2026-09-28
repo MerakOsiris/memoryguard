@@ -1,6 +1,6 @@
 <h1 align="center">MemoryGuard</h1>
 
-<!-- mcp-name: io.github.irisxc4/memoryguard -->
+<!-- mcp-name: io.github.MerakOsiris/memoryguard -->
 
 <p align="center">
   <strong>Governed shared memory for coding agents.</strong><br />
@@ -59,6 +59,8 @@ audience-aware identity handling, and improves conflict resolution:
   selected changes atomically. Ambiguous conflicts remain unresolved.
 - **Cursor Hook protection:** Cursor MemoryGuard Hooks now use a 30-second
   timeout, up from 15 seconds, with `failClosed: true`.
+
+v0.7.14 only corrects release metadata for the GitHub repository rename; it does not change runtime behavior. See the [v0.7.14 release note](docs/releases/v0.7.14.md).
 
 See the [v0.7.13 release note](docs/releases/v0.7.13.md) and
 [release history](CHANGELOG.md).
@@ -175,7 +177,7 @@ flowchart TB
 
 ### MCP Registry metadata
 
-This package exposes a local stdio MCP server as `io.github.irisxc4/memoryguard`.
+This package exposes a local stdio MCP server as `io.github.MerakOsiris/memoryguard`.
 Registry metadata is kept in [`server.json`](server.json), and the marker above
 ships with the PyPI package README. Releases are published through GitHub OIDC
 to PyPI and the official MCP Registry. Verify the current package version and

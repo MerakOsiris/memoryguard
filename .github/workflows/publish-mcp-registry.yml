@@ -44,7 +44,7 @@ jobs:
           if len(set(versions.values())) != 1:
               raise SystemExit(f"release metadata mismatch: {versions}")
 
-          marker = "mcp-name: io.github.irisxc4/memoryguard"
+          marker = "mcp-name: io.github.MerakOsiris/memoryguard"
           if marker not in Path("README.md").read_text(encoding="utf-8"):
               raise SystemExit("README.md is missing required PyPI mcp-name marker")
           PY
