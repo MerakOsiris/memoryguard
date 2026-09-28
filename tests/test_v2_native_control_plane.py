@@ -36,7 +36,14 @@ def _context(workspace: Path, *, admin: bool = False):
 
 def test_native_provider_install_reuses_bound_v2_identity_without_v1_group_creation(tmp_path: Path, monkeypatch):
     from memoryguard import provider_adapters
+    from memoryguard.runtime_v2.group_native import GroupControlService
 
+    fixture_home = tmp_path / "native-provider-home"
+    fixture_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fixture_home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    GroupControlService(tmp_path, write=True).bind_agents(["agent-a"], share_group_id="group-a")
+    GroupControlService(tmp_path, write=True).record_provider_identity("codex", "agent-a", "group-a")
     calls: list[dict] = []
 
     def fake_install(self, workspace="", share_group_id="default", agent_instance_id="", global_scope=False):

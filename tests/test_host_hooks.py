@@ -1906,6 +1906,8 @@ def test_v2_provider_install_routes_bound_identity_without_duplicate_hook_setup(
 ):
     from memoryguard import provider_adapters
 
+    _v2_bind(tmp_path)
+    GroupControlService(tmp_path, write=True).record_provider_identity("codex", "codex-agent", "group-a")
     calls: list[dict[str, object]] = []
 
     def fake_install(
