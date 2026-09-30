@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from memoryguard.codegraph_v2 import CodeGraphScope, CodeGraphStore
+from memoryguard.codegraph_v2 import CodeGraphScope, CodeGraphStore, stable_id
 from memoryguard.codegraph_v2.store import CODEGRAPH_AUX_SCHEMA
 from memoryguard.codegraph_v2.graphify_adapter import EXPORT_FORMAT, GraphifyCapability, GraphifyExportAdapter, GraphifyExportError
 from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
@@ -255,7 +255,7 @@ def _seed_v1_codegraph(root: Path) -> dict[str, str]:
         execute_sql_script(conn, _v1_aux_schema())
         conn.execute("INSERT INTO codegraph_schema_meta(key,value) VALUES('version','1')")
         legacy_scope = CodeGraphScope(str(root), "agent", "project", "codex", "group", "gui")
-        scope_id = CodeGraphStore._scope_id(legacy_scope)
+        scope_id = stable_id("scope", *legacy_scope.as_tuple())
         file_id = "legacy-file"
         revision_id = "legacy-revision"
         conn.execute(

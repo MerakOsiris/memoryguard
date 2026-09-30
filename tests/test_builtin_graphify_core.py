@@ -13,6 +13,17 @@ from memoryguard.graphify_core import CORE_VERSION, EXPORT_FORMAT, export_reposi
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_parse_diagnostic_remains_metadata_and_does_not_block_other_files(tmp_path: Path) -> None:
+    (tmp_path / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+    (tmp_path / "good.py").write_text("def good(): return 1\n", encoding="utf-8")
+    export = export_repository(tmp_path, parallel=False)
+    assert export["diagnostics"] and export["diagnostics"][0]["diagnostic_code"] == "python_parse_failed"
+    scope = CodeGraphScope(str(tmp_path), "agent", str(tmp_path), "codex", "group")
+    store = CodeGraphStore(tmp_path)
+    GraphifyExportAdapter(store).project(export, scope=scope)
+    assert store.query_symbols("good", scope=scope)
+
+
 def test_graphify_core_is_in_tree_and_no_graphifyy_dependency() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     dependency_block = pyproject.split("dependencies = [", 1)[1].split("]", 1)[0]

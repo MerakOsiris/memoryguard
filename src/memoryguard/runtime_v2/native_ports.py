@@ -924,6 +924,7 @@ class NativeV2RuntimePort:
         "get_codegraph_graph": ("codegraph_graph", "implemented", False),
         "list_codegraph_projects": ("codegraph_projects", "implemented", False),
         "build_codegraph": ("codegraph_build", "implemented", True),
+        "set_codegraph_automation": ("codegraph_automation", "implemented", True),
         "list_pending_enrichments": ("list_pending_enrichments", "implemented", False),
         "get_enrichment_status": ("enrichment_status", "implemented", False),
         "get_audit": ("reference_audit", "implemented", False),
@@ -2913,6 +2914,10 @@ class NativeV2RuntimePort:
             raise NativePortError("v2_context_engine_unavailable")
         packet = fn(request, candidates)
         payload = packet.to_dict() if hasattr(packet, "to_dict") else dict(packet)
+        if payload.get("status") == "ok":
+            from ..codegraph_v2.automation import agent_notice
+            payload["codegraph"] = agent_notice(self.workspace, dict(context),
+                start=bool(getattr(engine, "ready", False)) and getattr(engine, "state", "") == "V2_ACTIVE")
         try:
             from ..context_bootstrap import consume_codegraph_affected_receipt
 
@@ -5521,7 +5526,19 @@ class NativeV2RuntimePort:
                 }
         except Exception:
             source_projects = {}
+        from ..codegraph_v2.automation import known_projects
+        for project in known_projects(self.workspace, group_id):
+            canonical = canonical_project_ref(project)
+            source_projects.setdefault(canonical, {
+                "scope_id": "", "source_id": "", "project_ref": project, "project_key": canonical,
+                "label": Path(project).name, "agent_instance_id": "", "provider": "graphify",
+                "runtime_role": "", "file_count": 0, "symbol_count": 0, "built": False,
+                "authorized_source": False,
+            })
         if not self.layout.codegraph_db.is_file():
+            return [source_projects[key] for key in sorted(source_projects)]
+        from ..codegraph_v2.store import CodeGraphStore
+        if CodeGraphStore(self.workspace, initialize=False)._preflight() in {"fresh", "needs_aux"}:
             return [source_projects[key] for key in sorted(source_projects)]
         try:
             with open_database(self.layout.codegraph_db, readonly=True) as conn:
@@ -5565,7 +5582,7 @@ class NativeV2RuntimePort:
             # builder over older Agent-scoped imports of the same repository.
             preferred = not candidate["agent_instance_id"] and candidate["provider"] == "graphify"
             existing_preferred = bool(existing and existing.get("built") and not existing["agent_instance_id"] and existing["provider"] == "graphify")
-            if existing is None or (preferred and not existing_preferred):
+            if existing is None or not existing.get("built") or (preferred and not existing_preferred):
                 by_project[canonical] = candidate
         return [by_project[key] for key in sorted(by_project)]
 
@@ -5705,6 +5722,11 @@ class NativeV2RuntimePort:
     def _codegraph_projects(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         del payload
         projects = self._codegraph_gui_project_rows(context)
+        from ..codegraph_v2 import automation
+        authority = resolve_native_transport_context(context)
+        group = _text(authority.share_group_id)
+        for row in projects:
+            row["automation"] = automation.status(self.workspace, group, row["project_ref"], built=row.get("built", False))
         try:
             from ..codegraph_v2.graphify_adapter import GraphifyCapability
             capability = GraphifyCapability.detect().to_dict()
@@ -5716,7 +5738,34 @@ class NativeV2RuntimePort:
             "total": len(projects),
             "graphify": capability,
             "build_ready": bool(capability.get("available") and capability.get("metadata_export")),
+            "automation": automation.policy(self.workspace, group),
         }
+
+    def _codegraph_automation(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        authority = resolve_native_transport_context(context)
+        if not self._is_server_admin_gui_authority(authority):
+            raise NativePortError("admin_capability_required")
+        from ..codegraph_v2 import automation
+        group = _text(authority.share_group_id)
+        request = payload.get("request", payload)
+        if not isinstance(request, Mapping) or type(request.get("enabled")) is not bool or not group:
+            raise NativePortError("codegraph_automation_policy_invalid")
+        project = ""
+        if not request.get("default_policy") is True:
+            requested = canonical_project_ref(_text(request.get("codegraph_project_ref")))
+            projects = self._codegraph_projects({}, context)["projects"]
+            selected = next((row for row in projects if canonical_project_ref(row["project_ref"]) == requested), None)
+            if selected is None:
+                raise NativePortError("codegraph_project_not_found")
+            project = selected["project_ref"]
+        try:
+            result = automation.set_policy(self.workspace, group, request["enabled"], project)
+            if project and result["enabled"]:
+                result = (automation.status(self.workspace, group, project, built=True)
+                          if selected.get("built") else automation.ensure_graph(self.workspace, group, project, retry=True))
+            return {"ok": True, "automation": result}
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise NativePortError("codegraph_automation_policy_unavailable") from exc
 
     def _codegraph_build(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         if payload.get("confirmed") is not True:
@@ -6049,6 +6098,8 @@ class NativeV2RuntimePort:
             raise NativePortError(f"codegraph_update_failed_{name or 'unknown'}") from exc
 
     def _codegraph_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        if isinstance(payload.get("request"), Mapping):
+            payload = {**dict(payload["request"]), **{k: v for k, v in payload.items() if k != "request"}}
         scope = self._codegraph_scope(
             context,
             codegraph_project_ref=_text(payload.get("codegraph_project_ref")),
@@ -6059,6 +6110,14 @@ class NativeV2RuntimePort:
             from .group_native import GroupControlError, GroupControlService
 
             capability = GraphifyCapability.detect()
+            from ..codegraph_v2.store import CodeGraphStore
+            if CodeGraphStore(self.workspace, initialize=False)._preflight() in {"fresh", "needs_aux"}:
+                from ..codegraph_v2.automation import status as automation_status
+                return {"available": True, "scope_digest": scope.digest, "counts": {},
+                    "graphify": capability.to_dict(), "update_ready": bool(capability.available and capability.metadata_export),
+                    "automation": automation_status(self.workspace, scope.share_group_id, scope.project_ref),
+                    "incremental": {"supported": True, "built_scope": False, "active_binding": False,
+                                    "queue_depth": 0, "enabled": False}}
             store = self._domain_store("codegraph")
             counts = store.counts(scope=scope)
             scope_id = store._scope_id(scope)
@@ -6103,6 +6162,8 @@ class NativeV2RuntimePort:
                     raise
                 active_binding = False
             built_scope = bool(int(counts.get("active_source_files") or 0))
+            from ..codegraph_v2.automation import status as automation_status
+            automation = automation_status(self.workspace, group_id, scope.project_ref, built=built_scope)
             incremental = {
                 # Trusted PostToolUse refresh is built into this native port;
                 # enabled still requires a real graph and a current binding.
@@ -6110,7 +6171,7 @@ class NativeV2RuntimePort:
                 "built_scope": built_scope,
                 "active_binding": active_binding,
                 "queue_depth": queue_depth,
-                "enabled": bool(built_scope and active_binding),
+                "enabled": bool(built_scope and active_binding and automation["enabled"]),
             }
             return {
                 "available": True,
@@ -6118,6 +6179,7 @@ class NativeV2RuntimePort:
                 "counts": counts,
                 "graphify": capability.to_dict(),
                 "incremental": incremental,
+                "automation": automation,
                 "update_ready": bool(capability.available and capability.metadata_export),
                 "capability_error": "" if capability.available and capability.metadata_export else (capability.code or "graphify_metadata_export_unavailable"),
             }
@@ -6170,6 +6232,10 @@ class NativeV2RuntimePort:
         try:
             from ..codegraph_v2.models import normalize_provenance
 
+            from ..codegraph_v2.store import CodeGraphStore
+            if CodeGraphStore(self.workspace, initialize=False)._preflight() in {"fresh", "needs_aux"}:
+                return {"status": "NO_SOURCE", "scope_digest": graph_scope.digest,
+                    "project_ref": graph_scope.project_ref, "nodes": [], "edges": [], "node_count": 0, "edge_count": 0}
             store = self._domain_store("codegraph")
             preflight = getattr(store, "_preflight", None)
             if callable(preflight):
@@ -9053,6 +9119,7 @@ class NativeV2RuntimePort:
             "codegraph_graph": self._codegraph_graph,
             "codegraph_projects": self._codegraph_projects,
             "codegraph_build": self._codegraph_build,
+            "codegraph_automation": self._codegraph_automation,
             "codegraph_build_bound": self._codegraph_build_bound,
             "codegraph_query": self._codegraph_query,
             "codegraph_path": self._codegraph_path,

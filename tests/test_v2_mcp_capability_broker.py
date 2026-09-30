@@ -169,15 +169,16 @@ def test_capability_catalog_rejects_zero_bool_and_float_pagination(monkeypatch, 
 
 
 def test_gui_registry_has_only_reviewed_headless_broker_entries():
-    assert len(surfaces.GUI_OPERATION_SPECS) == 171
+    assert len(surfaces.GUI_OPERATION_SPECS) == 172
     assert len(surfaces.MCP_BROKER_GUI_METHOD_NAMES) == 163
-    assert len(surfaces.MCP_BROKER_GUI_EXCLUDED) == 8
+    assert len(surfaces.MCP_BROKER_GUI_EXCLUDED) == 9
     excluded_reasons = {
         name: surfaces.GUI_OPERATION_SPECS[name].mcp_broker
         for name in surfaces.MCP_BROKER_GUI_EXCLUDED
     }
     assert excluded_reasons == {
         "build_codegraph": "desktop_admin_only",
+        "set_codegraph_automation": "desktop_admin_only",
         "call_readonly": "bridge_protocol_only",
         "choose_publish_target_path": "desktop_only",
         "list_codegraph_projects": "desktop_admin_only",

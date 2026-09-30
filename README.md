@@ -39,7 +39,24 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.7.13
+## What's New in v0.7.15
+
+- **Automatic CodeGraph builds:** Trusted bootstrap starts a project's first
+  build in a background process. Default and per-project switches persist;
+  disabling automation preserves the graph. Supported file-write events
+  trigger incremental refresh.
+- **Clear graph navigation:** Switch between a file overview and symbols,
+  filter by file, inspect neighboring relations, and use zoom controls.
+- **Bounded temporary storage:** Ordinary graph queries read SQLite directly
+  instead of retaining full-database copies. Validation and installation
+  temporary files use the owning project/deployment cache and are cleaned up
+  when the operation ends.
+
+See the [v0.7.15 release note](docs/releases/v0.7.15.md) and
+[CodeGraph automation details](docs/codegraph-automation.md). Reconnect or
+restart hosts after upgrading and repairing their provider integration.
+
+### Earlier governance improvements
 
 v0.7.13 strengthens mandatory-rule replacement and recovery, improves
 audience-aware identity handling, and improves conflict resolution:

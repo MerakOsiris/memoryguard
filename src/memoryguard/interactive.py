@@ -830,6 +830,31 @@ tbody tr:last-child td { border-bottom: 0; }
 .codegraph-stage { background: radial-gradient(circle at 50% 45%, rgba(110,231,196,.10), transparent 46%), #06110d; }
 .codegraph-stage::before { background-image: linear-gradient(rgba(110,231,196,.09) 1px, transparent 1px), linear-gradient(90deg, rgba(110,231,196,.09) 1px, transparent 1px); }
 .codegraph-stat { background: rgba(110,231,196,.05); }
+.codegraph-view .dashboard-main { gap: 16px; }
+.codegraph-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.codegraph-heading h2 { margin: 0; font-size: 22px; letter-spacing: -.5px; }
+.codegraph-heading p { margin-top: 5px; color: var(--muted); font-size: 11px; }
+.codegraph-settings { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.codegraph-settings label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.codegraph-settings select { max-width: 260px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-solid); color: var(--fg); }
+.codegraph-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 24px; font-size: 11px; color: var(--muted); }
+.codegraph-summary strong { color: var(--fg); margin-right: 5px; font-size: 16px; font-variant-numeric: tabular-nums; }
+.codegraph-view .codegraph-stage { min-height: 420px; height: clamp(420px, calc(100dvh - 330px), 760px); background: #091714; border-color: rgba(153,195,178,.16); border-radius: 12px; }
+.codegraph-view .codegraph-stage::before { background-image: radial-gradient(rgba(153,195,178,.18) .7px, transparent .7px); background-size: 22px 22px; mask-image: none; opacity: .45; }
+.codegraph-stage-head { position: absolute; top: 16px; left: 18px; z-index: 2; pointer-events: none; color: #9eb7ad; font-size: 10px; letter-spacing: .03em; }
+.codegraph-stage-head strong { display: block; margin-bottom: 5px; color: #d5e7df; font-size: 12px; font-weight: 500; }
+.codegraph-view-switch { display: inline-flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 8px; background: rgba(0,0,0,.16); }
+.codegraph-view-switch button { padding: 7px 13px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font: inherit; font-size: 11px; cursor: pointer; }
+.codegraph-view-switch button[aria-pressed="true"] { color: #cbf7e6; background: #1b3b30; }
+.codegraph-view-switch button:hover { color: var(--fg); }
+.codegraph-view-switch button:focus-visible, .codegraph-zoom button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.codegraph-zoom { position: absolute; right: 16px; bottom: 16px; z-index: 2; display: flex; align-items: center; padding: 4px; gap: 3px; border: 1px solid var(--line); border-radius: 8px; background: #0d201b; }
+.codegraph-zoom button { width: 30px; height: 30px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #d6e9e0; font-size: 17px; cursor: pointer; }
+.codegraph-zoom button:hover { background: #254437; }
+.codegraph-zoom output { min-width: 42px; text-align: center; font-size: 10px; color: #a7c3b5; font-variant-numeric: tabular-nums; }
+.codegraph-view .codegraph-legend { background: #0d201b; border-color: var(--line); padding: 9px 11px; }
+.codegraph-view .codegraph-dot { width: 10px; height: 7px; border: 1px solid #6da58d; border-radius: 2px; background: #24513e; box-shadow: none; }
+.codegraph-view .codegraph-dot.symbol { border-color: #6d8da4; background: #244357; box-shadow: none; }
 .codegraph-automation { align-items: center; padding: 10px 12px; margin: 0; border: 1px solid var(--line); border-radius: 10px; background: rgba(110,231,196,.035); }
 .codegraph-automation strong { font-size: 11px; }
 .codegraph-automation p { margin-top: 2px; color: var(--muted); font-size: 10px; }
@@ -1156,6 +1181,8 @@ let codeGraph = null;
 let projectionMode = localStorage.getItem('memoryguard.projectionMode') || 'native';
 let cyInstance = null;
 let codeCyInstance = null;
+let codeGraphView = 'files';
+let codeGraphFocusFile = '';
 let selectedNeuronId = null;
 let selectedNeuronNode = null;
 let neuronDetailHydrationSeq = 0;
@@ -1186,6 +1213,9 @@ let governanceSubTab = 'recent_events';  // 治理台子视图
 let codeGraphLimit = 100;
 let codeGraphProvenance = '';
 let codeGraphProjects = [];
+let codeGraphAutomation = {};
+let codeGraphAutomationSaving = false;
+let codeGraphAutomationTimer = null;
 let codeGraphBuildReady = false;
 let selectedCodeGraphProject = localStorage.getItem('memoryguard.codeGraphProject') || '';
 let codeGraphBuildInFlight = false;
@@ -2691,11 +2721,47 @@ async function renderNeurons() {
 
 function codeGraphNodeLabel(node) {
   if (!node) return '未命名节点';
-  return String(node.label || node.path || node.name || node.signature || node.id || '未命名节点');
+  return guiPathText(node.label) || guiPathText(node.path) || guiPathText(node.name) || guiPathText(node.signature) || String(node.id || '未命名节点');
 }
 
 function codeGraphNodeColor(node) {
-  return node && node.node_kind === 'symbol' ? '#f6ad55' : '#63b3ed';
+  return node && node.node_kind === 'symbol' ? '#142737' : '#12372e';
+}
+
+function codeGraphDisplayGraph(graph) {
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  const files = new Map(nodes.filter(node => node.node_kind === 'file').map(node => [String(node.id), {...node, visible_symbols: 0}]));
+  const owner = new Map();
+  nodes.forEach(node => {
+    const file = files.get(String(node.file_id || ''));
+    owner.set(String(node.id), file ? String(file.id) : String(node.id));
+    if (file && node.node_kind === 'symbol') file.visible_symbols++;
+  });
+  if (codeGraphView === 'symbols') {
+    const visible = nodes.filter(node => !codeGraphFocusFile || owner.get(String(node.id)) === codeGraphFocusFile).map(node => files.get(String(node.id)) || node);
+    const ids = new Set(visible.map(node => String(node.id)));
+    return {...graph, nodes: visible, edges: (graph.edges || []).filter(edge => ids.has(String(edge.from_id || edge.source || edge.from || '')) && ids.has(String(edge.to_id || edge.target || edge.to || '')))};
+  }
+  const links = new Map();
+  (graph.edges || []).forEach(edge => {
+    const source = owner.get(String(edge.from_id || edge.source || edge.from || ''));
+    const target = owner.get(String(edge.to_id || edge.target || edge.to || ''));
+    if (!source || !target || source === target) return;
+    const key = JSON.stringify([source, target]);
+    const link = links.get(key) || {id: `file-link:${key}`, source, target, relation: '跨文件关系', weight: 0};
+    link.weight++;
+    links.set(key, link);
+  });
+  return {...graph, nodes: nodes.filter(node => owner.get(String(node.id)) === String(node.id)).map(node => files.get(String(node.id)) || node), edges: [...links.values()]};
+}
+
+function codeGraphCardLabel(node) {
+  if (node.node_kind !== 'file') return codeGraphNodeLabel(node).slice(0, 26);
+  const path = guiPathText(node.path, codeGraphNodeLabel(node)).replace(/\\/g, '/');
+  const parts = path.split('/');
+  const name = parts.pop();
+  const folder = parts.slice(-2).join('/') || String(node.language || '代码文件').toUpperCase();
+  return `${name.length > 27 ? name.slice(0, 24) + '…' : name}\n${folder.length > 30 ? '…' + folder.slice(-28) : folder}\n${Number(node.visible_symbols || 0)} 个符号`;
 }
 
 function codeGraphNodePositions(graph) {
@@ -2708,31 +2774,27 @@ function codeGraphNodePositions(graph) {
     symbolsByFile.get(fileId).push(node);
   });
   const positions = {};
-  const columns = Math.max(1, Math.ceil(Math.sqrt(files.length || 1)));
-  const gapX = 340;
-  const gapY = 290;
+  const columns = Math.max(1, Math.min(3, Math.ceil(Math.sqrt(files.length || 1))));
+  const gapX = symbolsByFile.size ? 360 : 304;
+  let rowY = 0;
+  let rowHeight = 0;
   files.forEach((file, index) => {
-    const row = Math.floor(index / columns);
     const col = index % columns;
+    if (index && col === 0) { rowY += rowHeight + 64; rowHeight = 0; }
     const x = (col - (columns - 1) / 2) * gapX;
-    const y = (row - (Math.ceil(files.length / columns) - 1) / 2) * gapY;
+    const y = rowY;
     positions[file.id] = {x, y};
     const symbols = (symbolsByFile.get(String(file.id)) || []).sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
     symbols.forEach((symbol, symbolIndex) => {
-      const perRing = 10;
-      const ring = Math.floor(symbolIndex / perRing);
-      const slot = symbolIndex % perRing;
-      const ringCount = Math.min(perRing, symbols.length - ring * perRing);
-      const angle = (slot / Math.max(1, ringCount)) * Math.PI * 2 + neuronHashUnit(symbol.id) * .08;
-      const radius = 72 + ring * 54;
-      positions[symbol.id] = {x: x + Math.cos(angle) * radius, y: y + Math.sin(angle) * radius};
+      positions[symbol.id] = {x: x + (symbolIndex % 2 ? 82 : -82), y: y + 84 + Math.floor(symbolIndex / 2) * 42};
     });
+    rowHeight = Math.max(rowHeight, symbols.length ? 100 + Math.ceil(symbols.length / 2) * 42 : 80);
   });
-  nodes.forEach((node, index) => {
+  let orphanIndex = 0;
+  nodes.forEach(node => {
     if (positions[node.id]) return;
-    const angle = neuronHashUnit(node.id) * Math.PI * 2;
-    const radius = 420 + index * 4;
-    positions[node.id] = {x: Math.cos(angle) * radius, y: Math.sin(angle) * radius};
+    positions[node.id] = {x: (orphanIndex % columns - (columns - 1) / 2) * gapX, y: rowY + rowHeight + 90 + Math.floor(orphanIndex / columns) * 56};
+    orphanIndex++;
   });
   return positions;
 }
@@ -2761,6 +2823,7 @@ function codeGraphElements(graph) {
     data: {
       id: String(node.id),
       label: codeGraphNodeLabel(node),
+      card_label: codeGraphCardLabel(node),
       label_priority: keyLabelIds.has(String(node.id || '')) ? 'true' : 'false',
       node_kind: node.node_kind || 'file',
       color: codeGraphNodeColor(node),
@@ -2797,9 +2860,27 @@ function codeGraphElements(graph) {
 
 function updateCodeGraphLabelPolicy() {
   if (!codeCyInstance) return;
-  const nodes = codeCyInstance.nodes();
-  if (codeCyInstance.zoom() >= 1.35) nodes.addClass('codegraph-label-zoomed');
+  const nodes = codeCyInstance.nodes('[node_kind = "symbol"]');
+  if (codeCyInstance.zoom() >= .65) nodes.addClass('codegraph-label-zoomed');
   else nodes.removeClass('codegraph-label-zoomed');
+  const readout = document.getElementById('codegraph-zoom');
+  if (readout) readout.textContent = `${Math.round(codeCyInstance.zoom() * 100)}%`;
+}
+
+function setCodeGraphView(value) {
+  codeGraphView = value === 'symbols' ? 'symbols' : 'files';
+  if (codeGraphView === 'symbols') codeGraphFocusFile = String(selectedCodeGraphNode?.node_kind === 'file' ? selectedCodeGraphNode.id : (codeGraph?.nodes || []).find(node => node.node_kind === 'file')?.id || '');
+  renderCodeGraphView();
+}
+
+function setCodeGraphFocus(value) {
+  codeGraphFocusFile = String(value || '');
+  renderCodeGraphView();
+}
+
+function zoomCodeGraph(factor) {
+  if (!codeCyInstance) return;
+  codeCyInstance.zoom({level: Math.max(codeCyInstance.minZoom(), Math.min(codeCyInstance.maxZoom(), codeCyInstance.zoom() * factor)), renderedPosition: {x: codeCyInstance.width() / 2, y: codeCyInstance.height() / 2}});
 }
 
 function codeGraphNodeForId(nodeId) {
@@ -2808,6 +2889,14 @@ function codeGraphNodeForId(nodeId) {
 }
 
 function codeGraphAutomationState(graph = {}) {
+  const automation = selectedCodeGraphProjectRow()?.automation || graph.codegraph_status?.automation;
+  if (automation) {
+    if (automation.policy_status !== 'ok') return {label: '自动建图设置不可用', tone: 'medium', detail: automation.error || '请检查设置文件权限与格式'};
+    if (!automation.enabled) return {label: '自动建图已关闭', tone: 'info', detail: '保留已有图谱；停止后续自动建图与增量刷新'};
+    const labels = {not_built: '自动建图待启动', queued: '自动建图已排队', building: '自动建图中', ready: '图谱已就绪 · 自动增量开启', no_source: '当前项目没有可索引代码', failed: '自动建图失败', blocked: '自动建图受阻'};
+    const errors = {codegraph_source_file_limit: '代码文件超过 10,000 个，请选择更具体的项目目录', codegraph_worker_interrupted: '后台建图已中断，可点击重试'};
+    return {label: labels[automation.build_status] || '自动建图待确认', tone: automation.build_status === 'ready' ? 'confirmed' : 'info', detail: errors[automation.error] || automation.error || '项目进入 Agent 可信工作目录后首次建图，写入代码后增量更新'};
+  }
   const source = graph && typeof graph === 'object' ? graph : {};
   const incremental = source.codegraph_status && typeof source.codegraph_status === 'object'
     ? source.codegraph_status.incremental : null;
@@ -2839,6 +2928,7 @@ function codeGraphAutomationState(graph = {}) {
 }
 
 function selectedCodeGraphProjectRow() {
+  if (!selectedCodeGraphProject) return null;
   return codeGraphProjects.find(item => item.source_id === selectedCodeGraphProject
     || item.project_key === selectedCodeGraphProject || item.project_ref === selectedCodeGraphProject) || null;
 }
@@ -2854,7 +2944,26 @@ function codeGraphProjectControls() {
     ? `<label>项目<select aria-label="CodeGraph 项目" onchange="setCodeGraphProject(this.value)"><option value="" ${selectedCodeGraphProject ? '' : 'selected'}>${codeGraphProjects.length > 1 ? '选择项目' : '自动选择'}</option>${options}</select></label>`
     : '<span class="muted">尚未构建任何项目 CodeGraph</span>';
   const buildLabel = codeGraphBuildInFlight ? '正在构建…' : (codeGraphProjects.length ? '构建 / 更新项目' : '选择项目并构建');
-  return `${select}<button class="btn ${codeGraphProjects.length ? '' : 'btn-primary'}" type="button" onclick="buildCodeGraphFromFolder()" ${codeGraphBuildInFlight || !codeGraphBuildReady ? 'disabled' : ''}>${buildLabel}</button>`;
+  const project = selectedCodeGraphProjectRow();
+  const disabled = codeGraphAutomationSaving || codeGraphAutomation.policy_status !== 'ok';
+  const controls = `<label title="默认开启；新项目进入 Agent 工作目录后自动建图。项目单独设置优先。"><input type="checkbox" role="switch" aria-label="新项目默认自动建图" ${codeGraphAutomation.default_enabled ? 'checked' : ''} ${disabled ? 'disabled' : ''} onchange="setCodeGraphAutomation(this.checked, true)">新项目默认自动建图</label>
+    ${project ? `<label title="开启后首次建图，随后自动增量更新；关闭保留已有图谱。"><input type="checkbox" role="switch" aria-label="当前项目自动建图" ${project.automation?.enabled ? 'checked' : ''} ${disabled ? 'disabled' : ''} onchange="setCodeGraphAutomation(this.checked, false)">当前项目自动建图</label>` : ''}
+    ${project && ['failed', 'blocked', 'not_built', 'no_source'].includes(project.automation?.build_status) && project.automation?.enabled ? '<button class="btn" type="button" onclick="setCodeGraphAutomation(true, false)">启动 / 重试自动建图</button>' : ''}`;
+  return `${select}${controls}<button class="btn ${codeGraphProjects.length ? '' : 'btn-primary'}" type="button" onclick="buildCodeGraphFromFolder()" ${codeGraphBuildInFlight || !codeGraphBuildReady ? 'disabled' : ''}>${buildLabel}</button>`;
+}
+
+async function setCodeGraphAutomation(enabled, defaultPolicy) {
+  if (codeGraphAutomationSaving) return;
+  const project = selectedCodeGraphProjectRow();
+  if (!defaultPolicy && !project) return;
+  codeGraphAutomationSaving = true;
+  renderCodeGraphView();
+  try {
+    const result = await callApi('set_codegraph_automation', {enabled, default_policy: defaultPolicy, codegraph_project_ref: project?.project_ref || ''});
+    if (result.error || result.ok === false) throw new Error(apiErrorMessage(result, '自动建图设置失败'));
+    await refreshCodeGraph(enabled ? '自动建图已开启' : '自动建图已关闭，已有图谱保留');
+  } catch (error) { showToast(error.message || String(error), 'error'); }
+  finally { codeGraphAutomationSaving = false; renderCodeGraphView(); }
 }
 
 async function loadCodeGraphProjects() {
@@ -2862,6 +2971,7 @@ async function loadCodeGraphProjects() {
   if (result.error || result.ok === false) throw new Error(apiErrorMessage(result, 'CodeGraph 项目列表读取失败'));
   codeGraphProjects = Array.isArray(result.projects) ? result.projects : [];
   codeGraphBuildReady = result.build_ready === true;
+  codeGraphAutomation = result.automation || {};
   if (selectedCodeGraphProject && !selectedCodeGraphProjectRow()) selectedCodeGraphProject = '';
   if (!selectedCodeGraphProject && codeGraphProjects.length === 1) {
     selectedCodeGraphProject = codeGraphProjects[0].source_id || codeGraphProjects[0].project_key || codeGraphProjects[0].project_ref || '';
@@ -2896,6 +3006,7 @@ function renderCodeGraphEmpty(message = '当前范围没有 CodeGraph 数据。'
     <p>代码结构图独立于记忆核心。Graphify 只写入文件/符号/关系元数据，不会把代码正文塞进长期记忆。</p></div>
     <section class="card empty-state"><div><div class="empty-orb"></div><p>${escapeHtml(message)}</p>
       <div class="codegraph-controls" style="justify-content:center;margin-top:14px">${codeGraphProjectControls()}<button class="btn" type="button" onclick="refreshCodeGraph()">刷新 CodeGraph</button></div>
+      <p class="muted" style="margin-top:10px">${escapeHtml(codeGraphAutomationState(codeGraph || {}).label)} · ${escapeHtml(codeGraphAutomationState(codeGraph || {}).detail)}</p>
       ${!codeGraphBuildReady ? '<p class="muted" style="margin-top:10px">内置 Graphify Core 当前不可用，请运行 MemoryGuard 诊断/修复；无需安装外部 Graphify。</p>' : ''}</div></section>`);
   renderStatusRail();
 }
@@ -2916,21 +3027,26 @@ function renderCodeGraphView() {
   if (!nodes.length) {
     const emptyMessage = graph.status === 'PROJECT_REQUIRED'
       ? '当前共享组有多个 CodeGraph 项目，请选择一个项目。'
-      : (graph.status === 'NO_SOURCE' ? '当前共享组尚未构建任何 CodeGraph 项目。' : '当前项目没有 CodeGraph 节点。');
+      : (graph.status === 'NO_SOURCE' ? (selectedCodeGraphProjectRow() ? '当前项目尚未建立 CodeGraph 图谱。' : '当前共享组尚未构建任何 CodeGraph 项目。') : '当前项目没有 CodeGraph 节点。');
     renderCodeGraphEmpty(emptyMessage);
     return;
   }
   selectedCodeGraphNode = null;
+  if (codeGraphFocusFile && !nodes.some(node => String(node.id) === codeGraphFocusFile)) codeGraphFocusFile = String(nodes.find(node => node.node_kind === 'file')?.id || '');
+  const displayGraph = codeGraphDisplayGraph(graph);
+  const formatCount = value => Number(value || 0).toLocaleString('zh-CN');
   setContent(`<div class="dashboard-view codegraph-view"><div class="dashboard-main">
-    <div class="compact-toolbar"><div class="toolbar-grow"><span class="eyebrow">Independent code projection</span><h2>CodeGraph</h2></div>
+    <div class="codegraph-heading"><div><h2>代码结构</h2><p>从文件看全局，沿连接查看代码关系。</p></div><div class="codegraph-view-switch" role="group" aria-label="代码图视图"><button type="button" aria-pressed="${codeGraphView === 'files'}" onclick="setCodeGraphView('files')">文件总览</button><button type="button" aria-pressed="${codeGraphView === 'symbols'}" onclick="setCodeGraphView('symbols')">符号展开</button></div></div>
+    <div class="codegraph-settings">
       ${codeGraphProjectControls()}
-      <label>分支 <span>${escapeHtml(selectedCodeGraphProjectRow()?.branch || graph.branch || '后端未返回')}</span></label>
+      ${codeGraphView === 'symbols' ? `<label>当前文件<select aria-label="符号所属文件" onchange="setCodeGraphFocus(this.value)"><option value="" ${!codeGraphFocusFile ? 'selected' : ''}>全部文件</option>${nodes.filter(node => node.node_kind === 'file').map(node => `<option value="${escapeHtml(node.id)}" ${String(node.id) === codeGraphFocusFile ? 'selected' : ''}>${escapeHtml(codeGraphNodeLabel(node))}</option>`).join('')}</select></label>` : ''}
+      ${selectedCodeGraphProjectRow()?.branch || graph.branch ? `<span class="muted">分支 ${escapeHtml(selectedCodeGraphProjectRow()?.branch || graph.branch)}</span>` : ''}
       <label>节点上限<select aria-label="CodeGraph 节点上限" onchange="setCodeGraphLimit(this.value)">${[50, 100, 200, 500].map(limit => `<option value="${limit}" ${limit === codeGraphLimit ? 'selected' : ''}>${limit}</option>`).join('')}</select></label>
       <span class="chip chip-${codeGraphAutomationState(graph).tone}" title="${escapeHtml(codeGraphAutomationState(graph).detail)}">${escapeHtml(codeGraphAutomationState(graph).label)}</span>
-      <button class="btn" type="button" onclick="fitCodeGraph()">重置视野</button><button class="btn btn-primary" type="button" onclick="refreshCodeGraph()">刷新</button><span class="muted">默认仅标重点节点，悬停或选中显示标签，放大后显示全部。</span>
+      <button class="btn" type="button" onclick="refreshCodeGraph()">刷新</button>
     </div>
-    <div class="kpi-grid"><div class="kpi"><span>当前节点</span><strong>${count}</strong></div><div class="kpi"><span>当前关系</span><strong>${edgeCount}</strong></div><div class="kpi"><span>项目符号</span><strong>${Number(totalCounts.symbols || graph.displayed_symbol_count || 0)}</strong></div><div class="kpi"><span>项目关系</span><strong>${Number(totalCounts.edges || edgeCount)}</strong></div></div>
-    <section class="codegraph-stage" aria-label="CodeGraph 代码结构图"><div class="codegraph-canvas" id="codegraph-canvas"></div><div class="codegraph-legend"><span><i class="codegraph-dot"></i>文件</span><span><i class="codegraph-dot symbol"></i>符号</span></div></section>
+    <div class="codegraph-summary"><span><strong>${formatCount(count)}</strong>当前节点</span><span><strong>${formatCount(edgeCount)}</strong>当前关系</span><span><strong>${formatCount(totalCounts.symbols || graph.displayed_symbol_count)}</strong>项目符号</span><span><strong>${formatCount(totalCounts.edges || edgeCount)}</strong>项目关系</span></div>
+    <section class="codegraph-stage" aria-label="CodeGraph 代码结构图"><div class="codegraph-stage-head"><strong>${codeGraphView === 'files' ? '文件关系总览' : '文件与符号'}</strong>${codeGraphView === 'files' ? '同文件符号合并显示 · 仅展示当前范围的跨文件关系' : '符号按所属文件排列 · 放大查看名称'}</div><div class="codegraph-canvas" id="codegraph-canvas"></div><div class="codegraph-legend"><span><i class="codegraph-dot"></i>文件</span>${codeGraphView === 'symbols' ? '<span><i class="codegraph-dot symbol"></i>符号</span>' : ''}<span>点击聚焦 · 空白处取消</span></div><div class="codegraph-zoom" role="group" aria-label="图谱缩放"><button type="button" aria-label="缩小代码图" onclick="zoomCodeGraph(.8)">−</button><output id="codegraph-zoom" aria-label="缩放比例">100%</output><button type="button" aria-label="放大代码图" onclick="zoomCodeGraph(1.25)">+</button><button type="button" aria-label="适应画布" title="适应画布" onclick="fitCodeGraph()">⌗</button></div></section>
   </div></div>`);
   renderStatusRail();
   if (typeof cytoscape === 'undefined') {
@@ -2942,30 +3058,35 @@ function renderCodeGraphView() {
   }
   codeCyInstance = cytoscape({
     container: document.getElementById('codegraph-canvas'),
-    elements: codeGraphElements(graph),
+    elements: codeGraphElements(displayGraph),
     style: [
       { selector: 'node', style: {
-        'shape': 'ellipse', 'width': 22, 'height': 22, 'background-color': 'data(color)',
-        'border-width': 1.4, 'border-color': '#d8f3ff', 'border-opacity': .8,
-        'label': '', 'color': '#d9f1ff', 'font-size': 9,
-        'font-family': 'Segoe UI, PingFang SC, sans-serif', 'text-valign': 'bottom',
-        'text-halign': 'center', 'text-margin-y': 7, 'text-wrap': 'wrap', 'text-max-width': 120,
-        'text-outline-width': 2, 'text-outline-color': '#06101a',
+        'shape': 'roundrectangle', 'width': 146, 'height': 28, 'background-color': 'data(color)',
+        'border-width': 1, 'border-color': '#436078', 'border-opacity': .8,
+        'label': '', 'color': '#b7cad8', 'font-size': 11,
+        'font-family': 'Segoe UI, Microsoft YaHei, sans-serif', 'text-valign': 'center',
+        'text-halign': 'center', 'text-wrap': 'ellipsis', 'text-max-width': 128,
+        'overlay-opacity': 0,
       }},
-      { selector: 'node[node_kind = "file"]', style: {'width': 30, 'height': 30, 'border-width': 2} },
-      { selector: 'node[label_priority = "true"], node:selected, node.codegraph-label-hover, node.codegraph-label-zoomed', style: {'label': 'data(label)'} },
+      { selector: 'node[label_priority = "true"], node:selected, node.codegraph-label-hover, node.codegraph-label-zoomed', style: {'label': 'data(card_label)'} },
+      { selector: 'node[node_kind = "file"]', style: {'width': 256, 'height': 86, 'border-color': '#487a64', 'border-width': 1.3, 'label': 'data(card_label)', 'text-wrap': 'wrap', 'text-max-width': 244, 'font-size': 16, 'line-height': 1.4, 'font-weight': 500, 'color': '#d0eadc'} },
       { selector: 'edge', style: {
-        'width': 1.1, 'line-color': '#63b3ed', 'line-opacity': .34,
-        'curve-style': 'bezier', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#63b3ed',
+        'width': 1.2, 'line-color': '#588876', 'opacity': .32,
+        'curve-style': 'bezier', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#588876', 'arrow-scale': .7,
       }},
-      { selector: 'edge:selected', style: {'line-color': '#f6ad55', 'target-arrow-color': '#f6ad55', 'width': 2.2} },
-      { selector: 'node:selected', style: {'border-color': '#fff6c7', 'border-width': 3} },
+      { selector: '.codegraph-muted', style: {'opacity': .12} },
+      { selector: 'edge:selected, edge.codegraph-focused', style: {'line-color': '#b5dcc6', 'target-arrow-color': '#b5dcc6', 'width': 2, 'opacity': .9} },
+      { selector: 'node:selected', style: {'border-color': '#c9e4ae', 'border-width': 2.5, 'background-color': '#254936'} },
     ],
-    layout: {name: 'preset', fit: true, padding: 58},
-    minZoom: .2, maxZoom: 3.6,
+    layout: {name: 'preset', fit: true, padding: 64},
+    minZoom: .05, maxZoom: 1.6, wheelSensitivity: .2,
   });
   codeCyInstance.on('tap', 'node', event => {
     selectedCodeGraphNode = codeGraphNodeForId(event.target.id());
+    const neighborhood = event.target.closedNeighborhood();
+    codeCyInstance.elements().removeClass('codegraph-muted codegraph-focused');
+    codeCyInstance.elements().not(neighborhood).addClass('codegraph-muted');
+    neighborhood.edges().addClass('codegraph-focused');
     renderStatusRail();
   });
   codeCyInstance.on('mouseover', 'node', event => event.target.addClass('codegraph-label-hover'));
@@ -2975,6 +3096,7 @@ function renderCodeGraphView() {
   codeCyInstance.on('tap', event => {
     if (event.target === codeCyInstance) {
       selectedCodeGraphNode = null;
+      codeCyInstance.elements().removeClass('codegraph-muted codegraph-focused');
       renderStatusRail();
     }
   });
@@ -2999,10 +3121,12 @@ async function renderCodeGraph() {
 }
 
 async function refreshCodeGraph(message = '') {
+  clearTimeout(codeGraphAutomationTimer);
+  await loadCodeGraphProjects();
   const selected = selectedCodeGraphProjectRow();
   const request = {
     codegraph_source_id: selected?.source_id || '',
-    codegraph_project_ref: selected?.source_id ? '' : (selectedCodeGraphProject || ''),
+    codegraph_project_ref: selected?.source_id ? '' : (selected?.project_ref || selectedCodeGraphProject || ''),
     limit: codeGraphLimit,
     provenance: codeGraphProvenance,
   };
@@ -3013,6 +3137,11 @@ async function refreshCodeGraph(message = '') {
   codeGraph = {...graph, codegraph_status: codegraphStatus};
   if (Array.isArray(codeGraph.projects) && !codeGraphProjects.length) codeGraphProjects = codeGraph.projects;
   renderCodeGraphView();
+  if (codeGraphProjects.some(item => ['queued', 'building'].includes(item.automation?.build_status))) {
+    codeGraphAutomationTimer = setTimeout(() => {
+      if (state.activeTab === 'codegraph') refreshCodeGraph().catch(error => showToast(error.message, 'error'));
+    }, 2000);
+  }
   if (message) showToast(message, 'success');
 }
 
@@ -3077,7 +3206,8 @@ async function setCodeGraphLimit(value) {
 
 function fitCodeGraph() {
   if (!codeCyInstance) return;
-  codeCyInstance.fit(undefined, 58);
+  codeCyInstance.elements().removeClass('codegraph-muted codegraph-focused');
+  codeCyInstance.fit(undefined, 64);
   updateCodeGraphLabelPolicy();
 }
 

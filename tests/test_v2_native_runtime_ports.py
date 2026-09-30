@@ -529,8 +529,8 @@ def test_registry_is_complete_and_digest_is_stable(tmp_path):
     # Phase-11 acceptance requires every canonical GUI operation to resolve to
     # a native handler. A missing handler is a blocker, never a retired success.
     # Keep these counts aligned with canonical GUI registry expansion.
-    assert coverage["surfaces"]["gui"]["total"] == 171
-    assert coverage["surfaces"]["gui"]["implemented"] == 171
+    assert coverage["surfaces"]["gui"]["total"] == 172
+    assert coverage["surfaces"]["gui"]["implemented"] == 172
     assert coverage["surfaces"]["gui"]["blocker"] == 0
     gui_by_name = {
         item["name"]: item for item in coverage["surfaces"]["gui"]["entries"]

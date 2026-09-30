@@ -274,7 +274,7 @@ def export_repository(
         if not isinstance(item, Mapping):
             continue
         safe = {
-            key: value for key, value in item.items()
+            ("diagnostic_code" if key == "code" else key): value for key, value in item.items()
             if key in {"code", "error_type", "limit", "bytes", "count"}
             and isinstance(value, (str, int, bool))
         }

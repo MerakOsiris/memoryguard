@@ -131,6 +131,23 @@ const historyColorsDistinct = new Set([
 ]).size === 3;
 
 const codePositions = sandbox.codeGraphNodePositions({nodes: codeNodes});
+const overview = sandbox.codeGraphDisplayGraph({nodes: codeNodes, edges: [
+  {source: 'symbol:0', target: 'symbol:1'},
+  {source: 'symbol:12', target: 'symbol:13'},
+  {source: 'symbol:1', target: 'symbol:0'},
+  {source: 'file:0', target: 'symbol:0'},
+  {source: 'missing', target: 'symbol:0'},
+]});
+const overviewValid = overview.nodes.length === 12
+  && overview.edges.length === 2
+  && overview.edges.some(edge => edge.source === 'file:0' && edge.target === 'file:1' && edge.weight === 2)
+  && overview.nodes.reduce((sum, node) => sum + node.visible_symbols, 0) === 88;
+vm.runInContext("codeGraphView = 'symbols'; codeGraphFocusFile = 'file:0';", sandbox);
+const focused = sandbox.codeGraphDisplayGraph({nodes: codeNodes, edges: [
+  {source: 'file:0', target: 'symbol:0'}, {source: 'symbol:0', target: 'symbol:1'},
+]});
+const focusValid = focused.nodes.length === 9 && focused.edges.length === 1
+  && focused.nodes.every(node => node.id === 'file:0' || node.file_id === 'file:0');
 const codeFinite = codeNodes.every(node => Number.isFinite(codePositions[node.id]?.x) && Number.isFinite(codePositions[node.id]?.y));
 const codeSeen = new Set();
 let codeExactOverlaps = 0;
@@ -150,7 +167,7 @@ for (let i = 0; i < fileIds.length; i++) {
 }
 process.stdout.write(JSON.stringify({
   finite, exactOverlaps, minHistoryDistance, mainBranchDistance, rulesRadius, historyRadius,
-  codeFinite, codeExactOverlaps, minFileDistance, ruleColorsDistinct, historyColorsDistinct,
+  codeFinite, codeExactOverlaps, minFileDistance, ruleColorsDistinct, historyColorsDistinct, overviewValid, focusValid,
 }));
 """
     with tempfile.TemporaryDirectory() as tmp:
@@ -180,5 +197,7 @@ def test_dense_neuron_layout_separates_rule_and_history_leaves() -> None:
     assert result["codeFinite"] is True
     assert result["codeExactOverlaps"] == 0
     assert result["minFileDistance"] >= 280
+    assert result["overviewValid"] is True
+    assert result["focusValid"] is True
     assert result["ruleColorsDistinct"] is True
     assert result["historyColorsDistinct"] is True

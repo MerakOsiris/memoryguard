@@ -385,10 +385,16 @@ def _snapshot_python_if_ready(snapshot_root: Path | None) -> str:
 
 def _run_snapshot_command(argv: list[str]) -> None:
     import subprocess
+    from .data_home import resolve_cache_home
 
     # Build tools can emit a mix of UTF-8 and the Windows locale. Output is
     # diagnostic-only here; byte capture avoids reader-thread decode failures.
-    completed = subprocess.run(argv, check=False, capture_output=True)
+    cache = resolve_cache_home() / "runtime-build"
+    cache.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="memoryguard-install-", dir=cache) as temporary:
+        env = {**os.environ, "TMP": temporary, "TEMP": temporary, "TMPDIR": temporary,
+               "PIP_NO_CACHE_DIR": "1"}
+        completed = subprocess.run(argv, check=False, capture_output=True, env=env)
     if int(completed.returncode or 0) != 0:
         raise RuntimeError("editable_install_snapshot_failed")
 
@@ -517,11 +523,15 @@ def prepare_provider_mcp_launch(
     unchanged source reuses the existing snapshot. Cache/bytecode is ignored.
     """
     inspected = dict(origin or inspect_distribution_origin())
+    src = Path(source_root).expanduser() if source_root else _source_root_from_direct_url(direct_url)
+    if src is None:
+        src = _live_source_root()
     root = Path(snapshot_root).expanduser() if snapshot_root else None
     if root is None:
         try:
-            from .data_home import resolve_data_home
-            root = resolve_data_home() / MCP_RUNTIME_DIRNAME
+            from .data_home import resolve_deployment_home
+            deployment = src if src is not None and src.is_dir() else resolve_deployment_home()
+            root = deployment / ".memoryguard" / MCP_RUNTIME_DIRNAME
         except Exception:
             root = None
     # A non-editable wheel is already the trusted immutable runtime.  Ignore
@@ -565,9 +575,6 @@ def prepare_provider_mcp_launch(
         # Repository tests import src via pytest pythonpath and must not pip.
         result["reason"] = "repository_tests_use_src"
         return result
-    src = Path(source_root).expanduser() if source_root else _source_root_from_direct_url(direct_url)
-    if src is None:
-        src = _live_source_root()
     if src is None or root is None:
         return _unavailable_launch(result, "editable_install_source_unavailable")
     keyed_root = root / _source_snapshot_key(src)

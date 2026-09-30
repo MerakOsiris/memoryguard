@@ -90,7 +90,7 @@ def _run_upgrade(root: Path, *, apply: bool = False, confirm: str | None = None,
 
 
 def test_public_upgrade_0_6_2_global_workspace_is_zero_write_then_explicitly_active(tmp_path: Path, capsys) -> None:
-    assert __version__ == "0.7.14"
+    assert __version__ == "0.7.15"
     root = tmp_path / "global-memoryguard-home"
     binding = _legacy_0_6_2_fixture(root)
     before_binding = binding.read_bytes()

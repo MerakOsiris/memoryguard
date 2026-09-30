@@ -111,6 +111,7 @@ _MCP_BROKER_UNAVAILABLE = {
     "submit_request": "bridge_protocol_only",
     "list_codegraph_projects": "desktop_admin_only",
     "build_codegraph": "desktop_admin_only",
+    "set_codegraph_automation": "desktop_admin_only",
 }
 
 # Headless MCP entrypoints that reuse a narrow, bound GUI business operation.
@@ -390,6 +391,7 @@ _add("get_codegraph_graph", "codegraph_graph", "codegraph", "read", "codegraph_g
 _add("list_codegraph_projects", "codegraph_projects", "codegraph", "read", "codegraph_projects")
 _add("codegraph_status", "codegraph_status", "codegraph", "read", "codegraph_status", parameters=("request",))
 _add("build_codegraph", "codegraph_build", "codegraph", "mutation", "codegraph_build", execution="task", parameters=("source_id", "confirmed"), cancel_operation="task_cancel")
+_add("set_codegraph_automation", "codegraph_automation", "codegraph", "mutation", "codegraph_automation", parameters=("request",))
 _add("get_projection_source_map", "projection_source_map", "projection", "read", "gui_projection_query", parameters=("scope", "agent_instance_id", "share_group_id", "mode"))
 _add("get_build_progress", "task_status", "runtime", "read", "gui_task_status", parameters=("run_id",))
 _add("build_projection", "projection_build", "projection", "mutation", "gui_projection_command", execution="task", parameters=("confirmed", "mode", "scope", "agent_instance_id", "share_group_id", "progress", "llm_agent", "llm_cli", "enrich_mode"), cancel_operation="task_cancel")

@@ -2836,7 +2836,7 @@ def _best_effort_codegraph_file_refresh(
     try:
         from .codegraph_v2.refresh import queue_host_file_refresh
 
-        queue_host_file_refresh(
+        result = queue_host_file_refresh(
             workspace,
             payload=payload,
             tool_name=tool_name,
@@ -2845,6 +2845,11 @@ def _best_effort_codegraph_file_refresh(
             host_event="post_tool",
             trusted_host=True,
         )
+        if result.get("reason") == "codegraph_project_not_built":
+            from .codegraph_v2.automation import ensure_graph
+            ensure_graph(workspace, str(payload.get("share_group_id") or ""),
+                str(payload.get("cwd") or ""), agent=str(payload.get("agent_instance_id") or ""),
+                provider=str(payload.get("provider") or "graphify"), retry=True)
     except Exception:
         return
 
@@ -2993,6 +2998,9 @@ def _render_context(packet: dict[str, Any]) -> str:
         "长期记忆写入只使用 memoryguard_memory_write；"
         "不得写入宿主原生记忆文件。"
     )
+    codegraph = packet.get("codegraph") or context_packet.get("codegraph") or {}
+    if isinstance(codegraph, dict) and codegraph.get("message"):
+        lines.append("[项目工具] " + str(codegraph["message"])[:600])
     return "\n".join(lines)
 
 
@@ -4496,6 +4504,7 @@ def _run_hook_unlocked(
                 **payload,
                 "share_group_id": share_group_id,
                 "agent_instance_id": agent_instance_id,
+                "provider": normalized_provider,
             },
             tool_name=tool_name,
             tool_input=tool_input,

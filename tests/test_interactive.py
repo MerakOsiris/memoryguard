@@ -1045,7 +1045,8 @@ def test_codegraph_label_strategy_is_explicit_and_zoom_safe() -> None:
     assert 'node[label_priority = "true"], node:selected, node.codegraph-label-hover, node.codegraph-label-zoomed' in html
     assert "codeCyInstance.on('mouseover', 'node'" in html
     assert "codeCyInstance.on('zoom', updateCodeGraphLabelPolicy);" in html
-    assert "默认仅标重点节点，悬停或选中显示标签，放大后显示全部。" in html
+    assert "同文件符号合并显示 · 仅展示当前范围的跨文件关系" in html
+    assert "文件总览" in html and "符号展开" in html
 
 
 def test_automatic_scope_decisions_stay_collapsed_with_chinese_event_labels() -> None:

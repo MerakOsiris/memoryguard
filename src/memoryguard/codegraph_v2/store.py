@@ -21,7 +21,7 @@ import sqlite3
 import stat
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
-from ..storage.database import execute_sql_script, open_database, open_database_snapshot
+from ..storage.database import execute_sql_script, open_database
 from ..storage.layout import WorkspaceV2Layout
 from ..rule_scope import canonical_project_ref
 from ..storage.schema import initialize_database
@@ -412,7 +412,7 @@ class CodeGraphStore:
         if not self.db_path.is_file():
             return "fresh"
         try:
-            with open_database_snapshot(self.db_path) as conn:
+            with self.connection() as conn:
                 tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 base = conn.execute("SELECT marker,version FROM schema_meta WHERE domain='codegraph' ORDER BY rowid LIMIT 1").fetchone() if "schema_meta" in tables else None
                 user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -514,10 +514,21 @@ class CodeGraphStore:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        """Yield a physically read-only connection for inspection."""
+        """Read the live graph, including committed WAL, without copying it."""
 
-        with open_database_snapshot(self.db_path) as conn:
+        before = self.db_path.stat()
+        immutable = not Path(str(self.db_path) + "-wal").exists()
+        # A checkpointed WAL database otherwise creates empty sidecars even
+        # with mode=ro. Immutable reads avoid those files; validate the main
+        # file after reading because an overlapping checkpoint can change it.
+        with open_database(self.db_path, readonly=True, immutable=immutable) as conn:
             yield conn
+        if immutable:
+            after = self.db_path.stat()
+            if (before.st_size, before.st_mtime_ns, before.st_ino) != (
+                after.st_size, after.st_mtime_ns, after.st_ino
+            ):
+                raise CodeGraphError("codegraph_changed_during_read_retry")
 
     def _scope(self, scope: CodeGraphScope | Mapping[str, Any] | None, *, write: bool = False) -> CodeGraphScope:
         if scope is None:
@@ -548,9 +559,32 @@ class CodeGraphStore:
             raise CodeGraphScopeError("trusted context required for codegraph writes")
         return checked
 
-    @staticmethod
-    def _scope_id(scope: CodeGraphScope) -> str:
-        return stable_id("scope", *scope.as_tuple())
+    def _scope_id(self, scope: CodeGraphScope) -> str:
+        scope = self._scope(scope)
+        key = scope.as_tuple()
+        # Migrated graphs can retain their original primary key after scope
+        # paths were canonicalized. Resolve by the complete trusted ACL tuple;
+        # recalculating the key alone makes those graphs appear empty.
+        cache = getattr(self, "_resolved_scope_ids", None)
+        if cache is None:
+            cache = self._resolved_scope_ids = {}
+        if key in cache:
+            return cache[key]
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT scope_id FROM graph_scopes WHERE "
+                "LOWER(REPLACE(workspace_id,char(92),'/'))=LOWER(REPLACE(?,char(92),'/')) "
+                "AND agent_instance_id=? "
+                "AND LOWER(REPLACE(project_ref,char(92),'/'))=LOWER(REPLACE(?,char(92),'/')) "
+                "AND LOWER(provider)=? AND share_group_id=? AND LOWER(runtime_role)=? "
+                "AND trusted_context=1",
+                key,
+            ).fetchall()
+        if len(rows) > 1:
+            raise CodeGraphScopeError("ambiguous stored codegraph scope")
+        resolved = str(rows[0][0]) if rows else stable_id("scope", *key)
+        cache[key] = resolved
+        return resolved
 
     def _ensure_scope(self, conn: sqlite3.Connection, scope: CodeGraphScope) -> str:
         scope_id = self._scope_id(scope)

@@ -19,6 +19,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from ..adapters import ChatGPTImportAdapter, GenericImportAdapter, safe_extract_zip
 from ..content.conversation_sync import ConversationEvent, ConversationSync
 from ..content.store import ContentStore, stable_id
+from ..data_home import resolve_cache_home
 from .source_control import SourceControlError, SourceControlService
 from .task_coordinator import TaskExecution
 
@@ -246,7 +247,9 @@ class ImportControlService:
         parse_target = target
         try:
             if target.is_file() and target.suffix.casefold() == ".zip":
-                temporary = tempfile.TemporaryDirectory(prefix="memoryguard-import-")
+                cache = resolve_cache_home(self.workspace) / "imports"
+                cache.mkdir(parents=True, exist_ok=True)
+                temporary = tempfile.TemporaryDirectory(prefix="memoryguard-import-", dir=cache)
                 parse_target = Path(temporary.name)
                 try:
                     safe_extract_zip(

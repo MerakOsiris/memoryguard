@@ -32,6 +32,7 @@ _NOISE_DIRS = frozenset({
     ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".venv", "venv", "env",
     "node_modules", "bower_components", "vendor", "dist", "build", "coverage",
     ".coverage", ".cache", "graphify-out", ".memoryguard", "target", "bin", "obj",
+    ".tmp", ".worktrees",
 })
 
 _MAX_FILE_BYTES = 8 * 1024 * 1024

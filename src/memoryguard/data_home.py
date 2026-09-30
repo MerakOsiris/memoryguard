@@ -129,6 +129,32 @@ def resolve_data_home(explicit: str | Path | None = None) -> Path:
     return _safe_default_data_home()
 
 
+def resolve_deployment_home() -> Path:
+    """Keep installed runtimes and scratch space with the MG deployment."""
+    package = Path(__file__).resolve().parent
+    for parent in package.parents:
+        if parent.name == ".memoryguard":
+            return parent.parent
+    if package.parent.name == "src":
+        return package.parent.parent
+    from .provider_adapters import _live_source_root
+
+    source = _live_source_root()
+    if source is not None and source.is_dir():
+        return source.resolve()
+    if sys.prefix != sys.base_prefix:
+        return Path(sys.prefix).resolve().parent
+    return package.parent
+
+
+def resolve_cache_home(workspace: str | Path | None = None) -> Path:
+    """Project scratch follows the project; global scratch follows MG."""
+    owner = Path(workspace).expanduser().resolve() if workspace else None
+    if owner is None or owner == resolve_runtime_data_home():
+        owner = resolve_deployment_home()
+    return owner / ".memoryguard" / "cache"
+
+
 def resolve_runtime_data_home(
     explicit: str | Path | None = None,
     *,

@@ -228,7 +228,7 @@ def queue_host_file_refresh(
     context = {
         "share_group_id": str((payload or {}).get("share_group_id") or ""),
         "agent_instance_id": str((payload or {}).get("agent_instance_id") or ""),
-        "provider": "graphify",
+        "provider": str((payload or {}).get("provider") or "graphify"),
         "runtime_role": "",
     }
     if not _has_active_binding(root, context):
@@ -237,6 +237,10 @@ def queue_host_file_refresh(
     if located is None:
         return {"status": "ignored", "reason": "codegraph_project_not_built"}
     source_root, scope = located
+    from .automation import policy
+    automation = policy(root, scope.share_group_id, scope.project_ref)
+    if not automation["enabled"]:
+        return {"status": "ignored", "reason": automation.get("error", "codegraph_automation_disabled")}
     raw_paths = _collect_payload_paths(payload, tool_input)
     relative_paths: list[str] = []
     for raw in raw_paths:

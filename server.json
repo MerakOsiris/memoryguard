@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/MerakOsiris/memoryguard",
-  "version": "0.7.14",
+  "version": "0.7.15",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "agent-memguard",
-      "version": "0.7.14",
+      "version": "0.7.15",
       "runtimeHint": "python",
       "packageArguments": [
         {

@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.7.15] - 2026-10-01
+
+### Added
+
+- Trusted Hook/MCP bootstrap can start a project's first CodeGraph build in a
+  background process. Default and per-project automation switches persist,
+  with explicit build states and retry support.
+- Bounded Agent capability hints expose CodeGraph discovery independently of
+  long-term memory budgets.
+- File overview and symbol views, file filtering, cross-file relation
+  aggregation, neighbor highlighting, and zoom controls.
+
+### Fixed
+
+- Ordinary CodeGraph queries read SQLite directly instead of creating and
+  retaining full-database temporary copies. WAL reads and concurrent
+  checkpoint detection retain read-only behavior.
+- Validation/import/install temporary files use the owning project's or
+  MemoryGuard deployment's cache and are cleaned up when the operation ends.
+  Installed runtime snapshots use the same deployment root; pip caching is
+  disabled during installation.
+- Migrated graph scopes remain discoverable, individual parser diagnostics do
+  not block other files, and structured paths render as readable text.
+
+### Upgrade boundary
+
+- Repair/reinstall the provider integration after upgrading, then reconnect
+  or restart hosts that cache MCP configuration. Automation depends on host
+  events and first builds are limited to 10,000 code files per project.
+
 ## [0.7.14] - 2026-09-28
 
 ### Changed
